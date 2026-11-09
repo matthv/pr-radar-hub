@@ -1,0 +1,27 @@
+# Example unit. Adjust the user, paths and client ID, then:
+#   sudo cp deploy/radar-hub.service /etc/systemd/system/ && sudo systemctl enable --now radar-hub
+[Unit]
+Description=PR Radar Hub - presence for PR Radar
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=hub
+Group=hub
+ExecStart=/opt/radar-hub/radar-hub serve
+Environment=HUB_PORT=8795
+Environment=HUB_ORG=ForestAdmin
+Environment=HUB_GITHUB_CLIENT_ID=Ov23li...
+Environment=HUB_GITHUB_TOKEN_FILE=/home/hub/.config/radar-hub/github-token
+Environment=HUB_DATA_DIR=/home/hub/.config/radar-hub/data
+# always: a plain kill by the hub's user restarts it, so deploying needs no root.
+Restart=always
+RestartSec=3
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/hub/.config/radar-hub/data
+
+[Install]
+WantedBy=multi-user.target
