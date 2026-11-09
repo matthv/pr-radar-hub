@@ -3,8 +3,10 @@
 This is the reference for writing the hub client inside PR Radar. It is meant to be
 enough on its own: everything the client needs to know about the hub is here.
 
-**What the hub does in v1:** it tells every connected radar which teammates have their
-radar running, with how many tabs and on which version. Nothing else.
+**What the hub does:** it tells every connected radar which teammates have their radar
+running, with how many tabs, on which version and whether they are available for a
+review or focused. It also relays two small person-to-person messages between online
+teammates: a kudos 🎉 and the offer of a PR Radar theme. Nothing else.
 
 **What the hub never receives:** no pull request, no repository name, no PR title, no
 GitHub token of the user. The only identity proof is a one-time GitHub sign-in that
@@ -20,7 +22,9 @@ grants no permission at all (see [Authentication](#authentication)).
 3. **Within protocol 1, the hub only ever adds** message types and fields. It never
    removes a field, renames it or changes its meaning. A breaking change gets
    protocol 2, and the hub then says so with `protocol_unsupported`.
-4. **Messages are small**: one JSON object per WebSocket text frame, at most 16 KiB.
+4. **Messages are small**: one JSON object per WebSocket text frame. A radar sends at
+   most 16 KiB per frame. The hub's frames stay under 16 KiB too, except a relayed
+   `theme_offer`, which adds up to 512 bytes to what the sender sent.
 
 ## Connection
 
@@ -34,9 +38,8 @@ grants no permission at all (see [Authentication](#authentication)).
 The keepalive uses native WebSocket control frames. Node's built-in `WebSocket`
 (global since Node 22) answers pings by itself: the client has nothing to do.
 
-> **Node version.** The global `WebSocket` is only stable from Node 22. PR Radar's
-> `engines` says `>=20`: on Node 20 or 21 the client should log one line ("hub
-> presence needs Node 22") and skip the hub entirely, rather than add a dependency.
+> **Node version.** PR Radar requires Node 22.4+ (`engines.node` is `>=22.4`), the first
+> release where the global `WebSocket` is stable. The client needs no dependency.
 
 ### Lifecycle
 
@@ -57,6 +60,9 @@ radar                                   hub
   | ---- status (on change) -----------> |
   | <--- presence (on any change) ------ |
   |                                      |
+  | ---- kudos / theme_offer ----------> |   relayed to the recipient's radars,
+  | <--- undelivered ------------------- |   or undelivered if they are offline
+  |                                      |
   | <--- error + close ----------------- |   on refusal, see the error table
 ```
 
@@ -74,7 +80,8 @@ The first message, and the only one accepted before `welcome`. Must arrive withi
   "hubToken": "rh_Q2x1Z…43 chars",
   "instanceId": "5f0c3b1e-8d0a-4f5e-9a51-3c6c1f2e7b90",
   "version": { "commit": "129a21f3c4d5e6f708192a3b4c5d6e7f80912a3b", "behind": 2 },
-  "tabs": 1
+  "tabs": 1,
+  "availability": "available"
 }
 ```
 
@@ -86,20 +93,100 @@ The first message, and the only one accepted before `welcome`. Must arrive withi
 | `version.commit` | string or `null` | Full SHA of PR Radar's `HEAD`, `null` if unknown (zip download, no git) |
 | `version.behind` | integer or `null` | Commits behind `origin/main`, as computed by `update.js`; `null` when not checked yet or the check failed |
 | `tabs` | integer ≥ 0 | Board tabs currently open. `0` still means *online*: the radar runs |
+| `availability` | `"available"`, `"focus"` or `null`, optional | The user's state, see below |
 
 A radar in **demo mode** (`PR_RADAR_DEMO`) never connects to the hub.
 
+#### `availability`
+
+The user's state, set in one click on any of their radars and shown to the others:
+
+- `"available"`: available for a review;
+- `"focus"`: focused, better not to disturb;
+- `null`: no state.
+
+The value belongs to the **login**, not to one radar: the hub keeps the last value
+received from any of the user's radars and shows it on their `presence` entry. Any
+other value counts as `null` (no `bad_message`). It lives in memory only and is
+forgotten when the user's last radar disconnects.
+
+An **absent** field keeps the current value, while `null` clears it. A radar that
+does not know the user's choice should therefore omit the field in `hello`, rather
+than send `null` and erase what another of the user's radars set.
+
 ### `status`
 
-Sent whenever `version` or `tabs` changes. Same fields as in `hello`, all optional:
+Sent whenever `version`, `tabs` or `availability` changes. Same fields as in `hello`, all optional:
 send what changed or everything, the hub keeps the last value of each field.
 
 ```json
 { "type": "status", "tabs": 2 }
 ```
 
-Debounce it (about 2 s): a tab reload is a close then an open, one `status` is enough.
-More than **30 messages per minute** on one connection closes it with `rate_limited`.
+```json
+{ "type": "status", "availability": "focus" }
+```
+
+Debounce tab changes (about 2 s): a tab reload is a close then an open, one `status` is
+enough. An availability change can go at once. More than **30 messages per minute** on
+one connection, all types together, closes it with `rate_limited`.
+
+### `kudos`
+
+A 🎉 for an online teammate.
+
+```json
+{ "type": "kudos", "to": "bexchauveto" }
+```
+
+| Field | Notes |
+| --- | --- |
+| `to` | GitHub login of the recipient, `[A-Za-z0-9-]{1,39}`, any case. Otherwise `bad_message` |
+
+- The hub sends a [`kudos`](#kudos-1) to **every** connected radar of `to`.
+- If `to` has no radar connected, the sender gets [`undelivered`](#undelivered).
+- A kudos to oneself is ignored.
+- At most **one kudos per minute** for a given sender → recipient pair, whichever
+  radars send it. The extra ones are **ignored** silently, without closing: the
+  radar should disable the button for a minute rather than rely on this.
+
+### `theme_offer`
+
+Offers one of the user's PR Radar themes to an online teammate.
+
+```json
+{
+  "type": "theme_offer",
+  "to": "bexchauveto",
+  "theme": { "name": "foret", "label": "Forêt", "icon": "🌲", "css": ":root { … }", "js": null }
+}
+```
+
+| Field | Notes |
+| --- | --- |
+| `to` | GitHub login of the recipient, as for `kudos` |
+| `theme` | An object. The hub checks its form only, and closes with `bad_message` if it is wrong |
+| `theme.name` | `[a-z0-9-]{1,40}` |
+| `theme.label` | String, at most 60 characters |
+| `theme.icon` | String, at most 16 characters (an emoji) |
+| `theme.css` | String, possibly empty |
+| `theme.js` | String or `null` (CSS-only theme); absent counts as `null` |
+
+Other fields of `theme` are relayed as they are.
+
+- The whole frame stays under **16 KiB**. Check the size before sending: a bigger
+  frame closes the connection with 1009.
+- The hub **never stores, logs or reads** the CSS and the JS. It relays the theme and
+  forgets it.
+- The hub sends a [`theme_offer`](#theme_offer-1) to **every** connected radar of `to`.
+- If `to` has no radar connected, the sender gets [`undelivered`](#undelivered).
+- An offer to oneself is ignored.
+- At most **5 offers per minute** per sender. The extra ones are ignored, without
+  closing.
+
+The hub does **not** vouch for the theme's content. A theme carries code that will run
+in the recipient's radar. Only the recipient decides whether to install it, after a
+clear warning in their page.
 
 ## Messages from the hub
 
@@ -142,7 +229,8 @@ again.
 ### `presence`
 
 The full list of online teammates. Sent right after `welcome`, then on every change
-(someone connects, leaves, changes tabs or version), at most once per second.
+(someone connects, leaves, changes tabs, version or availability), at most once per
+second.
 It always carries the whole list, never a diff: the radar replaces what it had.
 
 ```json
@@ -154,6 +242,7 @@ It always carries the whole list, never a diff: the radar replaces what it had.
       "avatarUrl": "https://avatars.githubusercontent.com/u/123456?v=4",
       "since": "2026-11-06T08:41:12Z",
       "tabs": 3,
+      "availability": "focus",
       "radars": [
         { "commit": "129a21f3c4d5…", "behind": 0, "tabs": 2, "since": "2026-11-06T08:41:12Z" },
         { "commit": "d7da2a3b9e8f…", "behind": 1, "tabs": 1, "since": "2026-11-06T09:02:40Z" }
@@ -171,10 +260,51 @@ It always carries the whole list, never a diff: the radar replaces what it had.
 | `online[]` | Members with at least one radar connected, sorted by `login`. The user's own entry is included |
 | `online[].since` | When their earliest connected radar connected |
 | `online[].tabs` | Sum over their radars |
+| `online[].availability` | `"available"`, `"focus"` or `null`: the last value received from any of their radars |
 | `online[].radars[]` | One per running radar (machine), oldest first. `behind` is the hub's best indication of who should update |
 | `recent[]` | Members not online now but seen in the last 14 days, most recent first |
 
 Timestamps are UTC, ISO 8601, second precision.
+
+### `kudos`
+
+```json
+{
+  "type": "kudos",
+  "from": "matthv",
+  "avatarUrl": "https://avatars.githubusercontent.com/u/123456?v=4",
+  "at": "2026-11-09T16:20:00Z"
+}
+```
+
+A teammate sent a kudos. Each of the recipient's radars gets one; showing the
+animation in every open tab is up to the radar.
+
+### `theme_offer`
+
+```json
+{
+  "type": "theme_offer",
+  "id": "Xq3b9kF0aZ1mRt7c",
+  "from": "matthv",
+  "avatarUrl": "https://avatars.githubusercontent.com/u/123456?v=4",
+  "theme": { "name": "foret", "label": "Forêt", "icon": "🌲", "css": ":root { … }", "js": null }
+}
+```
+
+`theme` is what the sender sent, as it was. `id` is random and unique per offer. Each of
+the recipient's radars gets the same `id`, which lets the radar show the offer once.
+There is no answer to send back: accepting or refusing stays local.
+
+### `undelivered`
+
+```json
+{ "type": "undelivered", "kind": "kudos", "to": "bexchauveto" }
+```
+
+Sent to the sender's radar only, when the recipient of a `kudos` or a `theme_offer`
+(`kind`) has no radar connected anymore. A message dropped by a limit gets no
+`undelivered`.
 
 ### `error`
 
@@ -259,7 +389,9 @@ The hub token only gives access to the presence list, but it is still a credenti
 | --- | --- |
 | Message size | 16 KiB |
 | `hello` delay | 10 s |
-| Messages per connection | 30 per minute |
+| Messages per connection | 30 per minute, all types |
+| Kudos | 1 per minute per sender → recipient pair (extra ignored) |
+| Theme offers | 5 per minute per sender (extra ignored) |
 | Connections per IP | 64 (one office NAT can carry the whole team) |
 | Sign-ins waiting for approval per IP | 5 |
 | Radars per login | 10; the 11th closes the oldest with `replaced` |
@@ -268,12 +400,13 @@ The hub token only gives access to the presence list, but it is still a credenti
 
 - Per login: avatar URL, SHA-256 hashes of the hub tokens with their issue date and
   revocation, first and last time seen, last version seen.
-- Live presence stays in memory and is lost when the hub restarts; radars reconnect
-  within seconds.
+- Live presence and availability stay in memory and are lost when the hub restarts;
+  radars reconnect within seconds and resend their state in `hello`.
+- Kudos and theme offers are relayed and forgotten: neither is written to disk or to
+  the logs. Only the recent send times are kept in memory, for the limits.
 - No GitHub token, no IP address, no pull request data.
 
 ## Extending the protocol
 
-Future features (who is reviewing what, kudos, a "new version" notice pushed by the
-hub) arrive as **new message types** within protocol 1. A radar that does not know them
+Future features (a "new version" notice pushed by the hub, for instance) arrive as **new message types** within protocol 1. A radar that does not know them
 ignores them (guarantee 2). Each new type is added to this file before the hub sends it.

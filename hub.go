@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"log"
@@ -13,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/coder/websocket"
 )
@@ -36,6 +39,14 @@ var closeCodes = map[string]websocket.StatusCode{
 var (
 	instanceIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{8,64}$`)
 	commitPattern     = regexp.MustCompile(`^[0-9a-f]{4,64}$`)
+	loginPattern      = regexp.MustCompile(`^[A-Za-z0-9-]{1,39}$`)
+	themeNamePattern  = regexp.MustCompile(`^[a-z0-9-]{1,40}$`)
+)
+
+const (
+	kudosPerPair    = time.Minute // one kudos per sender -> recipient pair in this window
+	offersPerMinute = 5           // theme offers per sender per minute
+	outQueue        = 16          // relayed messages waiting for one radar
 )
 
 type Hub struct {
@@ -50,6 +61,14 @@ type Hub struct {
 	perIP   map[string]int
 	pending map[string]int
 	dirty   bool
+	// avail is each online login's last availability, whichever of its radars sent it.
+	avail map[string]*string
+	// kudosSent and offersSent hold the recent sends for the relay limits.
+	kudosSent  map[string]time.Time
+	offersSent map[string][]time.Time
+
+	// sessions counts the WebSocket handlers still running.
+	sessions sync.WaitGroup
 }
 
 type radar struct {
@@ -61,19 +80,26 @@ type radar struct {
 	tabs       int
 	since      time.Time
 	notify     chan struct{}
+	out        chan []byte
 	kickOnce   sync.Once
+	// availability received before the radar was registered (hello, or status during sign-in).
+	availSet bool
+	avail    *string
 }
 
 func newHub(cfg Config, store *Store, gh *GitHub, logger *log.Logger) *Hub {
 	return &Hub{
-		cfg:     cfg,
-		store:   store,
-		gh:      gh,
-		now:     time.Now,
-		log:     logger,
-		radars:  map[string][]*radar{},
-		perIP:   map[string]int{},
-		pending: map[string]int{},
+		cfg:        cfg,
+		store:      store,
+		gh:         gh,
+		now:        time.Now,
+		log:        logger,
+		radars:     map[string][]*radar{},
+		perIP:      map[string]int{},
+		pending:    map[string]int{},
+		avail:      map[string]*string{},
+		kudosSent:  map[string]time.Time{},
+		offersSent: map[string][]time.Time{},
 	}
 }
 
@@ -86,9 +112,60 @@ type inMessage struct {
 	InstanceID string   `json:"instanceId"`
 	Version    *Version `json:"version"`
 	Tabs       *int     `json:"tabs"`
+	// Availability stays raw to tell an absent field (keep the value) from null.
+	Availability json.RawMessage `json:"availability"`
+	To           string          `json:"to"`
+	Theme        json.RawMessage `json:"theme"`
+}
+
+// availability reads the optional field: set is false when it is absent. Anything but
+// "available" or "focus" counts as null.
+func (m *inMessage) availability() (set bool, value *string) {
+	if len(m.Availability) == 0 {
+		return false, nil
+	}
+	var v string
+	if json.Unmarshal(m.Availability, &v) == nil && (v == "available" || v == "focus") {
+		return true, &v
+	}
+	return true, nil
+}
+
+// themeShape checks the form of a shared theme without reading its code.
+type themeShape struct {
+	Name  string  `json:"name"`
+	Label *string `json:"label"`
+	Icon  *string `json:"icon"`
+	CSS   *string `json:"css"`
+	JS    *string `json:"js"`
+}
+
+func validTheme(raw json.RawMessage) bool {
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(raw, &obj) != nil || obj == nil {
+		return false
+	}
+	var t themeShape
+	if json.Unmarshal(raw, &t) != nil {
+		return false
+	}
+	return themeNamePattern.MatchString(t.Name) &&
+		t.Label != nil && utf8.RuneCountInString(*t.Label) <= 60 &&
+		t.Icon != nil && utf8.RuneCountInString(*t.Icon) <= 16 &&
+		t.CSS != nil
 }
 
 func (m *inMessage) validate() bool {
+	switch m.Type {
+	case "kudos":
+		if !loginPattern.MatchString(m.To) {
+			return false
+		}
+	case "theme_offer":
+		if !loginPattern.MatchString(m.To) || !validTheme(m.Theme) {
+			return false
+		}
+	}
 	if m.Tabs != nil && (*m.Tabs < 0 || *m.Tabs > 1000) {
 		return false
 	}
@@ -132,11 +209,12 @@ type presenceRadar struct {
 }
 
 type presenceOnline struct {
-	Login     string          `json:"login"`
-	AvatarURL string          `json:"avatarUrl"`
-	Since     string          `json:"since"`
-	Tabs      int             `json:"tabs"`
-	Radars    []presenceRadar `json:"radars"`
+	Login        string          `json:"login"`
+	AvatarURL    string          `json:"avatarUrl"`
+	Since        string          `json:"since"`
+	Tabs         int             `json:"tabs"`
+	Availability *string         `json:"availability"`
+	Radars       []presenceRadar `json:"radars"`
 }
 
 type presenceRecent struct {
@@ -149,6 +227,27 @@ type presenceMessage struct {
 	Type   string           `json:"type"`
 	Online []presenceOnline `json:"online"`
 	Recent []presenceRecent `json:"recent"`
+}
+
+type kudosMessage struct {
+	Type      string `json:"type"`
+	From      string `json:"from"`
+	AvatarURL string `json:"avatarUrl"`
+	At        string `json:"at"`
+}
+
+type themeOfferMessage struct {
+	Type      string          `json:"type"`
+	ID        string          `json:"id"`
+	From      string          `json:"from"`
+	AvatarURL string          `json:"avatarUrl"`
+	Theme     json.RawMessage `json:"theme"`
+}
+
+type undeliveredMessage struct {
+	Type string `json:"type"`
+	Kind string `json:"kind"`
+	To   string `json:"to"`
 }
 
 func stamp(t time.Time) string { return t.UTC().Truncate(time.Second).Format(time.RFC3339) }
@@ -220,6 +319,9 @@ func (h *Hub) register(r *radar) {
 		list = append(list, old)
 	}
 	list = append(list, r)
+	if r.availSet {
+		h.avail[k] = r.avail
+	}
 	for len(list) > h.cfg.MaxRadarsPerLogin {
 		list[0].kick("replaced", "too many radars for this login")
 		list = list[1:]
@@ -241,6 +343,7 @@ func (h *Hub) unregister(r *radar) bool {
 	}
 	if len(list) == 0 {
 		delete(h.radars, k)
+		delete(h.avail, k)
 	} else {
 		h.radars[k] = list
 	}
@@ -262,6 +365,7 @@ func (h *Hub) kickLogin(login, code, message string) int {
 		r.kick(code, message)
 	}
 	delete(h.radars, key(login))
+	delete(h.avail, key(login))
 	h.dirty = true
 	return len(list)
 }
@@ -328,7 +432,7 @@ func (h *Hub) presence() presenceMessage {
 		if len(list) == 0 {
 			continue
 		}
-		entry := presenceOnline{Login: list[0].login, AvatarURL: list[0].avatarURL, Since: stamp(list[0].since), Radars: []presenceRadar{}}
+		entry := presenceOnline{Login: list[0].login, AvatarURL: list[0].avatarURL, Since: stamp(list[0].since), Availability: h.avail[key(list[0].login)], Radars: []presenceRadar{}}
 		for _, r := range list {
 			entry.Tabs += r.tabs
 			entry.Radars = append(entry.Radars, presenceRadar{Commit: r.version.Commit, Behind: r.version.Behind, Tabs: r.tabs, Since: stamp(r.since)})
@@ -376,27 +480,152 @@ func (h *Hub) broadcaster(ctx context.Context) {
 	}
 }
 
+// writer is the only goroutine writing to a registered radar after welcome: presence
+// updates and relayed messages.
 func (h *Hub) writer(ctx context.Context, r *radar) {
 	var last []byte
 	for {
+		var data []byte
 		select {
 		case <-ctx.Done():
 			return
+		case data = <-r.out:
 		case <-r.notify:
-		}
-		data, err := json.Marshal(h.presence())
-		if err != nil || bytes.Equal(data, last) {
-			continue
+			p, err := json.Marshal(h.presence())
+			if err != nil || bytes.Equal(p, last) {
+				continue
+			}
+			data, last = p, p
 		}
 		wctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		err = r.conn.Write(wctx, websocket.MessageText, data)
+		err := r.conn.Write(wctx, websocket.MessageText, data)
 		cancel()
 		if err != nil {
 			r.conn.CloseNow()
 			return
 		}
-		last = data
 	}
+}
+
+// queue hands a message to a radar's writer, dropping it if the radar is not keeping up.
+func (r *radar) queue(data []byte) bool {
+	select {
+	case r.out <- data:
+		return true
+	default:
+		return false
+	}
+}
+
+// Relays. Their content is never stored nor logged.
+
+// relay sends data to every radar of login `to`. It returns false when `to` is offline.
+func (h *Hub) relay(to string, data []byte) bool {
+	h.mu.Lock()
+	list := append([]*radar(nil), h.radars[key(to)]...)
+	h.mu.Unlock()
+	delivered := false
+	for _, r := range list {
+		if r.queue(data) {
+			delivered = true
+		}
+	}
+	return delivered
+}
+
+func (h *Hub) isOnline(login string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.radars[key(login)]) > 0
+}
+
+// allowKudos applies the one-per-minute limit for a sender -> recipient pair.
+func (h *Hub) allowKudos(from, to string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	now := h.now()
+	for k, t := range h.kudosSent {
+		if now.Sub(t) >= kudosPerPair {
+			delete(h.kudosSent, k)
+		}
+	}
+	k := key(from) + " " + key(to)
+	if _, recent := h.kudosSent[k]; recent {
+		return false
+	}
+	h.kudosSent[k] = now
+	return true
+}
+
+// allowOffer applies the five-per-minute limit for one sender.
+func (h *Hub) allowOffer(from string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	now := h.now()
+	for k, times := range h.offersSent {
+		kept := times[:0]
+		for _, t := range times {
+			if now.Sub(t) < time.Minute {
+				kept = append(kept, t)
+			}
+		}
+		if len(kept) == 0 {
+			delete(h.offersSent, k)
+		} else {
+			h.offersSent[k] = kept
+		}
+	}
+	k := key(from)
+	if len(h.offersSent[k]) >= offersPerMinute {
+		return false
+	}
+	h.offersSent[k] = append(h.offersSent[k], now)
+	return true
+}
+
+func (h *Hub) handleKudos(r *radar, m inMessage) {
+	if key(m.To) == key(r.login) {
+		return
+	}
+	if !h.isOnline(m.To) {
+		r.undelivered("kudos", m.To)
+		return
+	}
+	if !h.allowKudos(r.login, m.To) {
+		return
+	}
+	data, _ := json.Marshal(kudosMessage{Type: "kudos", From: r.login, AvatarURL: r.avatarURL, At: stamp(h.now())})
+	if !h.relay(m.To, data) {
+		r.undelivered("kudos", m.To)
+	}
+}
+
+func (h *Hub) handleThemeOffer(r *radar, m inMessage) {
+	if key(m.To) == key(r.login) {
+		return
+	}
+	if !h.isOnline(m.To) {
+		r.undelivered("theme_offer", m.To)
+		return
+	}
+	if !h.allowOffer(r.login) {
+		return
+	}
+	data, _ := json.Marshal(themeOfferMessage{Type: "theme_offer", ID: randomID(), From: r.login, AvatarURL: r.avatarURL, Theme: m.Theme})
+	if !h.relay(m.To, data) {
+		r.undelivered("theme_offer", m.To)
+	}
+}
+
+func (r *radar) undelivered(kind, to string) {
+	data, _ := json.Marshal(undeliveredMessage{Type: "undelivered", Kind: kind, To: to})
+	r.queue(data)
+}
+
+func randomID() string {
+	b := make([]byte, 12)
+	_, _ = rand.Read(b)
+	return base64.RawURLEncoding.EncodeToString(b)
 }
 
 func (h *Hub) keepalive(ctx context.Context, c *websocket.Conn) {
@@ -436,6 +665,8 @@ type session struct {
 }
 
 func (h *Hub) ServeWS(w http.ResponseWriter, req *http.Request) {
+	h.sessions.Add(1)
+	defer h.sessions.Done()
 	ip := clientIP(req)
 	if !h.acquireIP(ip) {
 		http.Error(w, "too many connections", http.StatusTooManyRequests)
@@ -532,7 +763,7 @@ func (s *session) run() {
 		return
 	}
 
-	r := &radar{conn: s.c, instanceID: hello.InstanceID, notify: make(chan struct{}, 1)}
+	r := &radar{conn: s.c, instanceID: hello.InstanceID, notify: make(chan struct{}, 1), out: make(chan []byte, outQueue)}
 	r.applyStatus(hello)
 
 	var issued string
@@ -592,21 +823,34 @@ func (s *session) run() {
 			r.failNow("bad_message", "invalid message")
 			return
 		}
-		if m.Type == "status" {
+		switch m.Type {
+		case "status":
 			s.h.mu.Lock()
 			r.applyStatus(m)
+			if set, v := m.availability(); set {
+				s.h.avail[key(r.login)] = v
+			}
 			s.h.dirty = true
 			s.h.mu.Unlock()
+		case "kudos":
+			s.h.handleKudos(r, m)
+		case "theme_offer":
+			s.h.handleThemeOffer(r, m)
 		}
 	}
 }
 
+// applyStatus records tabs and version; availability is kept on the radar until it
+// is registered, then belongs to the login (see run).
 func (r *radar) applyStatus(m inMessage) {
 	if m.Tabs != nil {
 		r.tabs = *m.Tabs
 	}
 	if m.Version != nil {
 		r.version = *m.Version
+	}
+	if set, v := m.availability(); set {
+		r.availSet, r.avail = true, v
 	}
 }
 

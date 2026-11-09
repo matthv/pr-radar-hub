@@ -23,7 +23,7 @@ const usage = `radar-hub — presence hub for PR Radar
   radar-hub revoke <login>     revoke a login and refuse its next sign-in
   radar-hub unrevoke <login>   allow a revoked login to sign in again
   radar-hub invite <login>     issue a hub token by hand (someone outside the org)
-  radar-hub watch [-tabs N]    act as a radar and print the presence it receives
+  radar-hub watch [-tabs N]    act as a radar and print what it receives
 
 Configuration comes from the environment, see .env.example.
 `

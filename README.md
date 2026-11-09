@@ -36,15 +36,22 @@ radar-hub status [-json]     who is online, versions, tokens (asks the running h
 radar-hub revoke <login>     revoke a login and refuse its next sign-in
 radar-hub unrevoke <login>   allow a revoked login to sign in again
 radar-hub invite <login>     issue a hub token by hand (someone outside the org)
-radar-hub watch [-tabs N]    act as a radar and print the presence it receives
+radar-hub watch [-tabs N]    act as a radar and print what it receives
 ```
 
 `status`, `revoke`, `unrevoke` and `invite` talk to the running hub through a unix socket
 in its data directory, so they must run as the hub's user with the same `HUB_DATA_DIR`.
 
 `watch` is the test radar: it signs in (showing the GitHub code the first time), reports a
-tab count and prints every presence update. Typing a number and Enter changes the tab
-count. It never takes a token on the command line: it reads `RADAR_HUB_TOKEN` from the
+tab count and prints every presence update, kudos and theme offer it receives (a theme
+offer is summed up, never printed). Lines typed on its input:
+
+- a number: the new tab count;
+- `available`, `focus` or `none`: the new availability;
+- `kudos <login>`: send a kudos;
+- `theme <login>`: offer a small test theme.
+
+It never takes a token on the command line: it reads `RADAR_HUB_TOKEN` from the
 environment, or the token it saved itself in `~/.config/radar-hub/watch-token`.
 
 ```

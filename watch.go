@@ -20,8 +20,15 @@ import (
 	"github.com/coder/websocket"
 )
 
-// watch plays a radar: it signs in, reports a tab count and prints every presence
-// it receives. Typing a number and Enter sends it as the new tab count.
+// watch plays a radar: it signs in, reports a tab count and prints what it receives.
+// Lines typed on stdin:
+//
+//	3                 new tab count
+//	available|focus|none   new availability
+//	kudos <login>     send a kudos
+//	theme <login>     offer a small test theme
+//
+// A received theme offer is summed up (name, label, sizes), never printed in full.
 
 func watchDir() string {
 	home, _ := os.UserHomeDir()
@@ -103,12 +110,29 @@ func cmdWatch(args []string) error {
 	go func() {
 		sc := bufio.NewScanner(os.Stdin)
 		for sc.Scan() {
-			n, err := strconv.Atoi(strings.TrimSpace(sc.Text()))
-			if err != nil || n < 0 {
-				fmt.Println("(type a tab count and Enter)")
+			f := strings.Fields(sc.Text())
+			var msg map[string]any
+			switch {
+			case len(f) == 1 && (f[0] == "available" || f[0] == "focus"):
+				msg = map[string]any{"type": "status", "availability": f[0]}
+			case len(f) == 1 && f[0] == "none":
+				msg = map[string]any{"type": "status", "availability": nil}
+			case len(f) == 2 && f[0] == "kudos":
+				msg = map[string]any{"type": "kudos", "to": f[1]}
+			case len(f) == 2 && f[0] == "theme":
+				msg = map[string]any{"type": "theme_offer", "to": f[1], "theme": map[string]any{
+					"name": "hub-test", "label": "Hub test", "icon": "🧪",
+					"css": ":root { --accent: #10b981; }", "js": nil}}
+			case len(f) == 1:
+				if n, err := strconv.Atoi(f[0]); err == nil && n >= 0 {
+					msg = map[string]any{"type": "status", "tabs": n}
+				}
+			}
+			if msg == nil {
+				fmt.Println("(type a tab count, available|focus|none, kudos <login> or theme <login>)")
 				continue
 			}
-			_ = writeJSON(ctx, c, map[string]any{"type": "status", "tabs": n})
+			_ = writeJSON(ctx, c, msg)
 		}
 	}()
 
@@ -151,6 +175,31 @@ func cmdWatch(args []string) error {
 			var p presenceMessage
 			_ = json.Unmarshal(data, &p)
 			printPresence(p)
+		case "kudos":
+			var k kudosMessage
+			_ = json.Unmarshal(data, &k)
+			fmt.Printf("🎉 kudos from %s\n", k.From)
+		case "theme_offer":
+			var o themeOfferMessage
+			var t themeShape
+			_ = json.Unmarshal(data, &o)
+			_ = json.Unmarshal(o.Theme, &t)
+			label := ""
+			if t.Label != nil {
+				label = *t.Label
+			}
+			cssLen, jsLen := 0, 0
+			if t.CSS != nil {
+				cssLen = len(*t.CSS)
+			}
+			if t.JS != nil {
+				jsLen = len(*t.JS)
+			}
+			fmt.Printf("theme offer %s from %s: %q (%s), css %d B, js %d B\n", o.ID, o.From, t.Name, label, cssLen, jsLen)
+		case "undelivered":
+			var u undeliveredMessage
+			_ = json.Unmarshal(data, &u)
+			fmt.Printf("undelivered %s: %s is not online\n", u.Kind, u.To)
 		case "error":
 			var e errorMessage
 			_ = json.Unmarshal(data, &e)
@@ -167,7 +216,11 @@ func cmdWatch(args []string) error {
 func printPresence(p presenceMessage) {
 	fmt.Printf("\n[%s] %d online\n", time.Now().Format("15:04:05"), len(p.Online))
 	for _, o := range p.Online {
-		fmt.Printf("  ● %-20s %d tab(s)", o.Login, o.Tabs)
+		av := ""
+		if o.Availability != nil {
+			av = " (" + *o.Availability + ")"
+		}
+		fmt.Printf("  ● %-20s %d tab(s)%s", o.Login, o.Tabs, av)
 		for _, r := range o.Radars {
 			fmt.Printf("  [%s]", versionText(r.Commit, r.Behind))
 		}
