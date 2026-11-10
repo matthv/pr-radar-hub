@@ -1087,3 +1087,53 @@ func TestWizzBadRef(t *testing.T) {
 	alice.send(map[string]any{"type": "wizz", "to": "not a login"})
 	alice.closedWith("bad_message", 4002)
 }
+
+func TestNudgeCapPerPair(t *testing.T) {
+	th := newTestHub(t)
+	alice := th.online(t, "alice", "instance-a1")
+	bob := th.online(t, "bob", "instance-b1")
+	carol := th.online(t, "carol", "instance-c1")
+	ref := func(i int) string { return fmt.Sprintf("%064x", i) }
+
+	for i := 1; i <= 3; i++ {
+		alice.send(map[string]any{"type": "wizz", "to": "bob", "ref": ref(i)})
+		if z := bob.expect("wizz"); z["ref"] != ref(i) {
+			t.Fatalf("wizz %d = %v", i, z)
+		}
+	}
+	// A 4th PR within 10 minutes: dropped, connection kept.
+	alice.send(map[string]any{"type": "wizz", "to": "bob", "ref": ref(4)})
+	bob.expectNo("wizz", 150*time.Millisecond)
+	// Plain wizzes and other pairs are not affected.
+	alice.send(map[string]any{"type": "wizz", "to": "bob"})
+	if z := bob.expect("wizz"); z["ref"] != nil {
+		t.Fatalf("wizz = %v", z)
+	}
+	alice.send(map[string]any{"type": "wizz", "to": "carol", "ref": ref(5)})
+	carol.expect("wizz")
+	carol.send(map[string]any{"type": "wizz", "to": "bob", "ref": ref(6)})
+	bob.expect("wizz")
+
+	age := func(d time.Duration) {
+		th.mu.Lock()
+		for k, times := range th.nudgesSent {
+			for i := range times {
+				times[i] = times[i].Add(-d)
+			}
+			th.nudgesSent[k] = times
+		}
+		for k, until := range th.wizzUntil {
+			th.wizzUntil[k] = until.Add(-d)
+		}
+		th.mu.Unlock()
+	}
+	// Still capped just before 10 minutes; the dropped one did not count.
+	age(9*time.Minute + 50*time.Second)
+	alice.send(map[string]any{"type": "wizz", "to": "bob", "ref": ref(4)})
+	bob.expectNo("wizz", 150*time.Millisecond)
+	age(11 * time.Second)
+	alice.send(map[string]any{"type": "wizz", "to": "bob", "ref": ref(4)})
+	if z := bob.expect("wizz"); z["ref"] != ref(4) {
+		t.Fatalf("wizz = %v", z)
+	}
+}

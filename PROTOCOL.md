@@ -198,10 +198,16 @@ can recognise the hash.
   always gets through.
 - The hub does not look at `availability`: the recipient's radar decides whether to
   animate in `"focus"`.
-- At most **one wizz with `ref` per 10 minutes** for a given sender → recipient → `ref`,
-  and **one plain wizz per 5 minutes** for a given sender → recipient. The extra ones are
-  ignored silently, without closing; a wizz dropped because of `acceptsWizz` does not
-  start the 5 minutes.
+- Limits, for a given sender → recipient:
+  - **one wizz with `ref` per 10 minutes for the same `ref`**;
+  - **at most 3 wizzes with `ref` in any 10 minutes, all `ref`s together**: the hub
+    cannot tell a real `ref` from a made-up one, and this cap keeps `acceptsWizz: false`
+    meaningful. Once it is reached, the radar should disable nudges to that person;
+  - **one plain wizz per 5 minutes**.
+
+  The extra ones are ignored silently, without closing. A dropped wizz counts toward
+  nothing: one dropped because of `acceptsWizz` does not start the 5 minutes, and one
+  dropped by a limit does not use a nudge.
 
 ### `theme_offer`
 
@@ -463,7 +469,7 @@ The hub token only gives access to the presence list, but it is still a credenti
 | Messages per connection | 30 per minute, all types |
 | Kudos | 1 per minute per sender → recipient pair (extra ignored) |
 | Theme offers | 5 per minute per sender (extra ignored) |
-| Wizz with `ref` | 1 per 10 minutes per sender → recipient → `ref` (extra ignored) |
+| Wizz with `ref` | 1 per 10 minutes per sender → recipient → `ref`, and 3 per 10 minutes per sender → recipient, all `ref`s together (extra ignored) |
 | Plain wizz | 1 per 5 minutes per sender → recipient (extra ignored) |
 | Connections per IP | 64 (one office NAT can carry the whole team) |
 | Sign-ins waiting for approval per IP | 5 |

@@ -49,6 +49,8 @@ const (
 	offersPerMinute = 5                // theme offers per sender per minute
 	wizzPerRef      = 10 * time.Minute // one wizz per sender -> recipient -> ref
 	wizzPerPair     = 5 * time.Minute  // one plain wizz (no ref) per sender -> recipient
+	nudgesPerPair   = 3                // wizzes with ref per sender -> recipient, all refs...
+	nudgeWindow     = 10 * time.Minute // ...within this window
 	outQueue        = 16               // relayed messages waiting for one radar
 )
 
@@ -73,6 +75,8 @@ type Hub struct {
 	offersSent map[string][]time.Time
 	// wizzUntil maps a sender/recipient(/ref) key to the end of its quiet period.
 	wizzUntil map[string]time.Time
+	// nudgesSent holds the recent wizzes with ref per sender/recipient pair.
+	nudgesSent map[string][]time.Time
 
 	// sessions counts the WebSocket handlers still running.
 	sessions sync.WaitGroup
@@ -111,6 +115,7 @@ func newHub(cfg Config, store *Store, gh *GitHub, logger *log.Logger) *Hub {
 		offersSent: map[string][]time.Time{},
 		noWizz:     map[string]bool{},
 		wizzUntil:  map[string]time.Time{},
+		nudgesSent: map[string][]time.Time{},
 	}
 }
 
@@ -667,8 +672,9 @@ func (h *Hub) setAcceptsWizz(k string, accepts bool) {
 	}
 }
 
-// allowWizz checks the recipient's choice for plain wizzes, then the quiet periods:
-// 10 minutes per sender -> recipient -> ref, 5 minutes per sender -> recipient without ref.
+// allowWizz checks the recipient's choice for plain wizzes, then the limits: 10 minutes
+// per sender -> recipient -> ref and at most 3 nudges per pair in 10 minutes, all refs
+// together; 5 minutes per sender -> recipient without ref. A dropped wizz uses nothing.
 func (h *Hub) allowWizz(from, to string, ref *string) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -681,12 +687,32 @@ func (h *Hub) allowWizz(from, to string, ref *string) bool {
 			delete(h.wizzUntil, k)
 		}
 	}
-	k, quiet := key(from)+" "+key(to), wizzPerPair
+	for k, times := range h.nudgesSent {
+		kept := times[:0]
+		for _, t := range times {
+			if now.Sub(t) < nudgeWindow {
+				kept = append(kept, t)
+			}
+		}
+		if len(kept) == 0 {
+			delete(h.nudgesSent, k)
+		} else {
+			h.nudgesSent[k] = kept
+		}
+	}
+	pair := key(from) + " " + key(to)
+	k, quiet := pair, wizzPerPair
 	if ref != nil {
-		k, quiet = k+" "+*ref, wizzPerRef
+		k, quiet = pair+" "+*ref, wizzPerRef
 	}
 	if _, recent := h.wizzUntil[k]; recent {
 		return false
+	}
+	if ref != nil {
+		if len(h.nudgesSent[pair]) >= nudgesPerPair {
+			return false
+		}
+		h.nudgesSent[pair] = append(h.nudgesSent[pair], now)
 	}
 	h.wizzUntil[k] = now.Add(quiet)
 	return true
