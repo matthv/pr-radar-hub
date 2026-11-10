@@ -659,6 +659,10 @@ func (h *Hub) handleThemeOffer(r *radar, m inMessage) {
 		return
 	}
 	data, _ := json.Marshal(themeOfferMessage{Type: "theme_offer", ID: randomID(), From: r.login, AvatarURL: r.avatarURL, Theme: m.Theme})
+	if int64(len(data)) > h.cfg.MaxThemeMessage+512 {
+		// Only an unusually long avatar URL gets here: keep the documented bound.
+		return
+	}
 	if !h.relay(m.To, data) {
 		r.undelivered("theme_offer", m.To)
 	}
@@ -800,7 +804,8 @@ func (h *Hub) ServeWS(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	defer c.CloseNow()
-	c.SetReadLimit(h.cfg.MaxMessage)
+	// Frames may reach the theme size; every other type is held to MaxMessage below.
+	c.SetReadLimit(h.cfg.MaxThemeMessage)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -811,6 +816,10 @@ func (h *Hub) ServeWS(w http.ResponseWriter, req *http.Request) {
 		for {
 			typ, data, err := c.Read(ctx)
 			if err != nil {
+				return
+			}
+			if int64(len(data)) > h.cfg.MaxMessage && (typ != websocket.MessageText || frameType(data) != "theme_offer") {
+				_ = c.Close(websocket.StatusMessageTooBig, "message too big")
 				return
 			}
 			select {
@@ -824,6 +833,15 @@ func (h *Hub) ServeWS(w http.ResponseWriter, req *http.Request) {
 
 	s := &session{h: h, c: c, ctx: ctx, ip: ip, frames: frames}
 	s.run()
+}
+
+// frameType reads the type of a frame, "" if it has none.
+func frameType(data []byte) string {
+	var m struct {
+		Type string `json:"type"`
+	}
+	_ = json.Unmarshal(data, &m)
+	return m.Type
 }
 
 // next waits for a frame. ok is false when the connection is gone or the timeout hit.

@@ -578,6 +578,88 @@ func TestMessageTooBig(t *testing.T) {
 	alice.closedWith("", websocket.StatusMessageTooBig)
 }
 
+func TestThemeOfferSize(t *testing.T) {
+	var logs strings.Builder
+	var logMu sync.Mutex
+	th := newTestHub(t)
+	th.log = log.New(writerFunc(func(p []byte) (int, error) { logMu.Lock(); defer logMu.Unlock(); return logs.Write(p) }), "", 0)
+	alice := th.online(t, "alice", "instance-a1")
+	bob := th.online(t, "bob", "instance-b1")
+
+	// A 100 KB theme goes through, both ways.
+	big := theme("dessin")
+	big["css"] = "/*big-theme-marker*/" + strings.Repeat("x", 100_000)
+	data, _ := json.Marshal(map[string]any{"type": "theme_offer", "to": "bob", "theme": big})
+	if len(data) <= 16<<10 || len(data) > 110<<10 {
+		t.Fatalf("frame size %d", len(data))
+	}
+	alice.sendRaw(data)
+	o := bob.expect("theme_offer")
+	if css, _ := o["theme"].(map[string]any)["css"].(string); len(css) != len(big["css"].(string)) {
+		t.Fatalf("css length %d", len(css))
+	}
+
+	// Still connected.
+	alice.send(map[string]any{"type": "status", "tabs": 3})
+	alice.presenceWhere(func(p presenceMessage) bool {
+		for _, o := range p.Online {
+			if o.Login == "alice" && o.Tabs == 3 {
+				return true
+			}
+		}
+		return false
+	})
+
+	files, _ := os.ReadDir(th.cfg.DataDir)
+	var disk []byte
+	for _, f := range files {
+		b, _ := os.ReadFile(filepath.Join(th.cfg.DataDir, f.Name()))
+		disk = append(disk, b...)
+	}
+	logMu.Lock()
+	leaked := strings.Contains(string(disk)+logs.String(), "big-theme-marker")
+	logMu.Unlock()
+	if leaked {
+		t.Fatal("theme content on disk or in the logs")
+	}
+
+	// Over 110 KiB, even a theme offer closes with 1009.
+	big["css"] = strings.Repeat("x", 111<<10)
+	data, _ = json.Marshal(map[string]any{"type": "theme_offer", "to": "bob", "theme": big})
+	alice.sendRaw(data)
+	alice.closedWith("", websocket.StatusMessageTooBig)
+}
+
+func TestOtherTypesStayAt16KiB(t *testing.T) {
+	frames := map[string][]byte{
+		"kudos":   []byte(`{"type":"kudos","to":"bob","pad":"` + strings.Repeat("x", 17<<10) + `"}`),
+		"unknown": []byte(`{"type":"something","pad":"` + strings.Repeat("x", 17<<10) + `"}`),
+		"no type": []byte(`{"pad":"` + strings.Repeat("x", 17<<10) + `"}`),
+		// A theme_offer type hidden in a nested object does not count.
+		"nested": []byte(`{"type":"status","x":{"type":"theme_offer"},"pad":"` + strings.Repeat("x", 17<<10) + `"}`),
+	}
+	for name, data := range frames {
+		t.Run(name, func(t *testing.T) {
+			th := newTestHub(t)
+			alice := th.online(t, "alice", "instance-a1")
+			alice.sendRaw(data)
+			alice.closedWith("", websocket.StatusMessageTooBig)
+		})
+	}
+	t.Run("binary", func(t *testing.T) {
+		th := newTestHub(t)
+		alice := th.online(t, "alice", "instance-a1")
+		_ = alice.c.Write(context.Background(), websocket.MessageBinary, []byte(`{"type":"theme_offer","pad":"`+strings.Repeat("x", 17<<10)+`"}`))
+		alice.closedWith("", websocket.StatusMessageTooBig)
+	})
+	t.Run("before hello", func(t *testing.T) {
+		th := newTestHub(t)
+		cl := th.dial(t)
+		cl.sendRaw([]byte(`{"type":"hello","pad":"` + strings.Repeat("x", 17<<10) + `"}`))
+		cl.closedWith("", websocket.StatusMessageTooBig)
+	})
+}
+
 func TestHelloTimeout(t *testing.T) {
 	th := newTestHub(t)
 	cl := th.dial(t)

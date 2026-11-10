@@ -27,6 +27,7 @@ type Config struct {
 	TokenWarning     time.Duration
 
 	MaxMessage           int64
+	MaxThemeMessage      int64
 	MaxPerIP             int
 	MaxPendingPerIP      int
 	MaxRadarsPerLogin    int
@@ -48,6 +49,7 @@ func defaultConfig() Config {
 		RecentWindow:         14 * 24 * time.Hour,
 		TokenWarning:         30 * 24 * time.Hour,
 		MaxMessage:           16 << 10,
+		MaxThemeMessage:      110 << 10,
 		MaxPerIP:             64,
 		MaxPendingPerIP:      5,
 		MaxRadarsPerLogin:    10,

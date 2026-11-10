@@ -23,9 +23,10 @@ grants no permission at all (see [Authentication](#authentication)).
 3. **Within protocol 1, the hub only ever adds** message types and fields. It never
    removes a field, renames it or changes its meaning. A breaking change gets
    protocol 2, and the hub then says so with `protocol_unsupported`.
-4. **Messages are small**: one JSON object per WebSocket text frame. A radar sends at
-   most 16 KiB per frame. The hub's frames stay under 16 KiB too, except a relayed
-   `theme_offer`, which adds up to 512 bytes to what the sender sent.
+4. **Messages are small**: one JSON object per WebSocket text frame, at most **16 KiB**
+   in both directions. The one exception is `theme_offer`: up to **110 KiB** from the
+   radar, and the relayed one adds at most 512 bytes to that (`id`, `from`,
+   `avatarUrl`).
 
 ## Connection
 
@@ -236,8 +237,10 @@ Offers one of the user's PR Radar themes to an online teammate.
 
 Other fields of `theme` are relayed as they are.
 
-- The whole frame stays under **16 KiB**. Check the size before sending: a bigger
-  frame closes the connection with 1009.
+- The whole frame stays under **110 KiB**, the only message allowed over 16 KiB. PR
+  Radar keeps the theme (name, label, icon, CSS, JS) under 100 KB, which leaves room
+  for the envelope. Check the size before sending: a bigger frame closes the connection
+  with 1009. The relayed offer is at most 512 bytes larger than what was sent.
 - The hub **never stores, logs or reads** the CSS and the JS. It relays the theme and
   forgets it.
 - The hub sends a [`theme_offer`](#theme_offer-1) to **every** connected radar of `to`.
@@ -414,7 +417,7 @@ reason, so a client that missed the message still knows.
 | `not_member` | 4014 | The GitHub account is not an active member of the org | Delete the stored token, **stop** until the radar restarts |
 | `revoked` | 4015 | The token was revoked by the hub admin, or the user left the org | Delete the stored token, **stop** until the radar restarts |
 | — | 1001 | The hub is restarting | Reconnect with backoff |
-| — | 1009 | A message over 16 KiB | Reconnect with backoff (and log) |
+| — | 1009 | A message over 16 KiB, or a `theme_offer` over 110 KiB | Reconnect with backoff (and log) |
 | — | 1011 | Hub internal error | Reconnect with backoff |
 | — (HTTP 429 on upgrade) | — | Too many connections from this IP | Reconnect with backoff |
 | — (network error, 502, 503…) | — | Hub down or unreachable | Reconnect with backoff |
@@ -468,7 +471,7 @@ The hub token only gives access to the presence list, but it is still a credenti
 
 | Limit | Value |
 | --- | --- |
-| Message size | 16 KiB |
+| Message size | 16 KiB; `theme_offer` 110 KiB (relayed: + 512 bytes at most) |
 | `hello` delay | 10 s |
 | Messages per connection | 30 per minute, all types |
 | Kudos | 1 per minute per sender → recipient pair (extra ignored) |
