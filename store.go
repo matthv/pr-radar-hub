@@ -9,6 +9,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -18,6 +19,29 @@ import (
 type Version struct {
 	Commit *string `json:"commit"`
 	Behind *int    `json:"behind"`
+	// Tag is the PR Radar release (git describe), or nil.
+	Tag *string `json:"tag"`
+}
+
+var tagPattern = regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+$`)
+
+// UnmarshalJSON accepts any tag value: one that is not a release tag counts as null,
+// so an odd value never closes the connection.
+func (v *Version) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Commit *string         `json:"commit"`
+		Behind *int            `json:"behind"`
+		Tag    json.RawMessage `json:"tag"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	v.Commit, v.Behind, v.Tag = raw.Commit, raw.Behind, nil
+	var tag string
+	if len(raw.Tag) > 0 && json.Unmarshal(raw.Tag, &tag) == nil && len(tag) <= 32 && tagPattern.MatchString(tag) {
+		v.Tag = &tag
+	}
+	return nil
 }
 
 type Token struct {

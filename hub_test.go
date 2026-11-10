@@ -1137,3 +1137,62 @@ func TestNudgeCapPerPair(t *testing.T) {
 		t.Fatalf("wizz = %v", z)
 	}
 }
+
+// Release tag.
+
+func TestVersionTag(t *testing.T) {
+	th := newTestHub(t)
+	token := th.issue(t, "alice")
+	cl := th.dial(t)
+	h := hello("instance-a1", token)
+	h["version"] = map[string]any{"commit": "abcdef1", "behind": 0, "tag": "v1.2.0"}
+	cl.send(h)
+	cl.expect("welcome")
+	tagIs := func(want string) func(presenceMessage) bool {
+		return func(p presenceMessage) bool {
+			if len(p.Online) != 1 || len(p.Online[0].Radars) != 1 {
+				return false
+			}
+			got := p.Online[0].Radars[0].Tag
+			return (want == "" && got == nil) || (got != nil && *got == want)
+		}
+	}
+	cl.presenceWhere(tagIs("v1.2.0"))
+
+	// A change triggers a presence; a version without tag clears it.
+	cl.send(map[string]any{"type": "status", "version": map[string]any{"commit": "abcdef1", "behind": 0, "tag": "v1.10.3"}})
+	cl.presenceWhere(tagIs("v1.10.3"))
+	cl.send(map[string]any{"type": "status", "version": map[string]any{"commit": "abcdef1", "behind": 0}})
+	cl.presenceWhere(tagIs(""))
+
+	// Odd values count as null and never close the connection.
+	for _, bad := range []any{"1.2.0", "v1.2", "v1.2.0-beta.1", "V1.2.0", " v1.2.0", 12, true, map[string]any{}, []any{"v1.2.0"}, "v١.٢.٣"} {
+		cl.send(map[string]any{"type": "status", "version": map[string]any{"commit": "abcdef1", "behind": 0, "tag": "v9.9.9"}})
+		cl.presenceWhere(tagIs("v9.9.9"))
+		cl.send(map[string]any{"type": "status", "version": map[string]any{"commit": "abcdef1", "behind": 0, "tag": bad}})
+		cl.presenceWhere(tagIs(""))
+	}
+
+	// The JSON always carries the field.
+	cl.send(map[string]any{"type": "status", "tabs": 2})
+	for {
+		m := cl.expect("presence")
+		online := m["online"].([]any)
+		r := online[0].(map[string]any)["radars"].([]any)[0].(map[string]any)
+		if r["tabs"].(float64) != 2 {
+			continue
+		}
+		if _, has := r["tag"]; !has {
+			t.Fatal("radars[].tag missing")
+		}
+		break
+	}
+
+	// Status shows it.
+	cl.send(map[string]any{"type": "status", "version": map[string]any{"commit": "abcdef1", "behind": 0, "tag": "v2.0.0"}})
+	cl.presenceWhere(tagIs("v2.0.0"))
+	r := th.report()
+	if len(r.Members) != 1 || len(r.Members[0].Radars) != 1 || r.Members[0].Radars[0].Tag == nil || *r.Members[0].Radars[0].Tag != "v2.0.0" {
+		t.Fatalf("report = %+v", r.Members)
+	}
+}

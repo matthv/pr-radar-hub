@@ -236,6 +236,7 @@ type welcomeMessage struct {
 type presenceRadar struct {
 	Commit *string `json:"commit"`
 	Behind *int    `json:"behind"`
+	Tag    *string `json:"tag"`
 	Tabs   int     `json:"tabs"`
 	Since  string  `json:"since"`
 }
@@ -481,7 +482,7 @@ func (h *Hub) presence() presenceMessage {
 		entry := presenceOnline{Login: list[0].login, AvatarURL: list[0].avatarURL, Since: stamp(list[0].since), Availability: h.avail[key(list[0].login)], AcceptsWizz: !h.noWizz[key(list[0].login)], Radars: []presenceRadar{}}
 		for _, r := range list {
 			entry.Tabs += r.tabs
-			entry.Radars = append(entry.Radars, presenceRadar{Commit: r.version.Commit, Behind: r.version.Behind, Tabs: r.tabs, Since: stamp(r.since)})
+			entry.Radars = append(entry.Radars, presenceRadar{Commit: r.version.Commit, Behind: r.version.Behind, Tag: r.version.Tag, Tabs: r.tabs, Since: stamp(r.since)})
 		}
 		online[key(entry.Login)] = true
 		msg.Online = append(msg.Online, entry)

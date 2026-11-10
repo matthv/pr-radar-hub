@@ -80,7 +80,7 @@ The first message, and the only one accepted before `welcome`. Must arrive withi
   "protocol": 1,
   "hubToken": "rh_Q2x1Z…43 chars",
   "instanceId": "5f0c3b1e-8d0a-4f5e-9a51-3c6c1f2e7b90",
-  "version": { "commit": "129a21f3c4d5e6f708192a3b4c5d6e7f80912a3b", "behind": 2 },
+  "version": { "commit": "129a21f3c4d5e6f708192a3b4c5d6e7f80912a3b", "behind": 2, "tag": "v1.2.0" },
   "tabs": 1,
   "availability": "available",
   "acceptsWizz": true
@@ -94,6 +94,7 @@ The first message, and the only one accepted before `welcome`. Must arrive withi
 | `instanceId` | string, 8–64 chars `[A-Za-z0-9_-]` | Random, generated once per machine and kept. Identifies this radar among the user's radars; never shown to other users |
 | `version.commit` | string or `null` | Full SHA of PR Radar's `HEAD`, `null` if unknown (zip download, no git) |
 | `version.behind` | integer or `null` | Commits behind `origin/main`, as computed by `update.js`; `null` when not checked yet or the check failed |
+| `version.tag` | string or `null`, optional | The PR Radar release, as `git describe --tags --abbrev=0` gives it: `^v[0-9]+\.[0-9]+\.[0-9]+$`, at most 32 characters. `null` when no release is reachable (before the first one, or a clone without tags). Absent, or any other value (a pre-release such as `v1.2.0-beta.1` included), counts as `null`, without `bad_message`: older radars do not send it |
 | `tabs` | integer ≥ 0 | Board tabs currently open. `0` still means *online*: the radar runs |
 | `availability` | `"available"`, `"focus"` or `null`, optional | The user's state, see below |
 | `acceptsWizz` | boolean, optional | Whether the user accepts plain wizzes, see below |
@@ -133,6 +134,8 @@ choice sends it again in `hello`.
 
 Sent whenever `version`, `tabs`, `availability` or `acceptsWizz` changes. Same fields as in `hello`, all optional:
 send what changed or everything, the hub keeps the last value of each field.
+`version` is one value: a `version` object replaces the previous one whole, so send
+`commit`, `behind` and `tag` together.
 
 ```json
 { "type": "status", "tabs": 2 }
@@ -288,8 +291,8 @@ again.
 ### `presence`
 
 The full list of online teammates. Sent right after `welcome`, then on every change
-(someone connects, leaves, changes tabs, version, availability or `acceptsWizz`), at
-most once per second.
+(someone connects, leaves, or changes tabs, version including `tag`, availability or
+`acceptsWizz`), at most once per second.
 It always carries the whole list, never a diff: the radar replaces what it had.
 
 ```json
@@ -304,8 +307,8 @@ It always carries the whole list, never a diff: the radar replaces what it had.
       "availability": "focus",
       "acceptsWizz": true,
       "radars": [
-        { "commit": "129a21f3c4d5…", "behind": 0, "tabs": 2, "since": "2026-11-06T08:41:12Z" },
-        { "commit": "d7da2a3b9e8f…", "behind": 1, "tabs": 1, "since": "2026-11-06T09:02:40Z" }
+        { "commit": "129a21f3c4d5…", "behind": 0, "tag": "v1.2.0", "tabs": 2, "since": "2026-11-06T08:41:12Z" },
+        { "commit": "d7da2a3b9e8f…", "behind": 1, "tag": null, "tabs": 1, "since": "2026-11-06T09:02:40Z" }
       ]
     }
   ],
@@ -323,6 +326,7 @@ It always carries the whole list, never a diff: the radar replaces what it had.
 | `online[].availability` | `"available"`, `"focus"` or `null`: the last value received from any of their radars |
 | `online[].acceptsWizz` | `false` when they refuse plain wizzes; the radar should then disable the plain wizz button |
 | `online[].radars[]` | One per running radar (machine), oldest first. `behind` is the hub's best indication of who should update |
+| `online[].radars[].tag` | Always present: the radar's release tag, or `null` (none, unknown, or an older radar). A change triggers a `presence` |
 | `recent[]` | Members not online now but seen in the last 14 days, most recent first |
 
 Timestamps are UTC, ISO 8601, second precision.

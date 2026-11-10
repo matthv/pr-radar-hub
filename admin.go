@@ -22,6 +22,7 @@ import (
 type statusRadar struct {
 	Commit *string   `json:"commit"`
 	Behind *int      `json:"behind"`
+	Tag    *string   `json:"tag"`
 	Tabs   int       `json:"tabs"`
 	Since  time.Time `json:"since"`
 }
@@ -60,7 +61,7 @@ func (h *Hub) report() statusReport {
 	}
 	for k, list := range h.radars {
 		for _, r := range list {
-			online[k] = append(online[k], statusRadar{Commit: r.version.Commit, Behind: r.version.Behind, Tabs: r.tabs, Since: r.since.UTC()})
+			online[k] = append(online[k], statusRadar{Commit: r.version.Commit, Behind: r.version.Behind, Tag: r.version.Tag, Tabs: r.tabs, Since: r.since.UTC()})
 		}
 	}
 	h.mu.Unlock()
@@ -212,6 +213,13 @@ func ago(t time.Time) string {
 	}
 }
 
+func tagText(tag *string) string {
+	if tag == nil {
+		return "-"
+	}
+	return *tag
+}
+
 func versionText(commit *string, behind *int) string {
 	c := "?"
 	if commit != nil && len(*commit) >= 7 {
@@ -255,7 +263,7 @@ func cmdStatus(cfg Config, asJSON bool) error {
 	fmt.Println()
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "LOGIN\tSTATE\tAVAILABILITY\tWIZZ\tVERSION\tTABS\tSEEN\tACCESS")
+	fmt.Fprintln(w, "LOGIN\tSTATE\tAVAILABILITY\tWIZZ\tTAG\tVERSION\tTABS\tSEEN\tACCESS")
 	for _, m := range rep.Members {
 		access := strings.Join(m.Sources, ",")
 		switch {
@@ -276,15 +284,15 @@ func cmdStatus(cfg Config, asJSON bool) error {
 				if i > 0 {
 					state, login, av, wz = "", "", "", ""
 				}
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\tsince %s\t%s\n", login, state, av, wz, versionText(r.Commit, r.Behind), r.Tabs, r.Since.Local().Format("15:04"), access)
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%d\tsince %s\t%s\n", login, state, av, wz, tagText(r.Tag), versionText(r.Commit, r.Behind), r.Tabs, r.Since.Local().Format("15:04"), access)
 			}
 			continue
 		}
-		v := "?"
+		v, tag := "?", "-"
 		if m.LastVersion != nil {
-			v = versionText(m.LastVersion.Commit, m.LastVersion.Behind)
+			v, tag = versionText(m.LastVersion.Commit, m.LastVersion.Behind), tagText(m.LastVersion.Tag)
 		}
-		fmt.Fprintf(w, "%s\toffline\t\t\t%s\t-\t%s\t%s\n", m.Login, v, ago(m.LastSeen), access)
+		fmt.Fprintf(w, "%s\toffline\t\t\t%s\t%s\t-\t%s\t%s\n", m.Login, tag, v, ago(m.LastSeen), access)
 	}
 	return w.Flush()
 }
