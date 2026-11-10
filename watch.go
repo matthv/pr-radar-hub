@@ -93,6 +93,8 @@ func cmdWatch(args []string) error {
 		return fmt.Errorf("connect %s: %w", *hubURL, err)
 	}
 	defer c.CloseNow()
+	// Relayed theme offers reach 110 KiB; the library's default limit is 32 KiB.
+	c.SetReadLimit(1 << 20)
 
 	hello := map[string]any{"type": "hello", "protocol": protocolVersion, "instanceId": instanceID, "tabs": *tabs}
 	v := map[string]any{"commit": nil, "behind": nil}
