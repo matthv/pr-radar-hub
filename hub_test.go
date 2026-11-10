@@ -918,3 +918,172 @@ func TestThemeOfferShape(t *testing.T) {
 type writerFunc func([]byte) (int, error)
 
 func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
+
+// Wizz.
+
+func acceptsWizzOf(p presenceMessage, login string) (bool, bool) {
+	for _, o := range p.Online {
+		if o.Login == login {
+			return o.AcceptsWizz, true
+		}
+	}
+	return false, false
+}
+
+func TestWizz(t *testing.T) {
+	var logs strings.Builder
+	var logMu sync.Mutex
+	th := newTestHub(t)
+	th.log = log.New(writerFunc(func(p []byte) (int, error) { logMu.Lock(); defer logMu.Unlock(); return logs.Write(p) }), "", 0)
+
+	alice := th.online(t, "alice", "instance-a1")
+	bobToken := th.issue(t, "bob")
+	bob1 := th.dial(t)
+	bob1.send(hello("instance-b1", bobToken))
+	bob1.expect("welcome")
+	bob2 := th.dial(t)
+	bob2.send(hello("instance-b2", bobToken))
+	bob2.expect("welcome")
+	carol := th.online(t, "carol", "instance-c1")
+	ref1 := strings.Repeat("ab", 32)
+	ref2 := strings.Repeat("cd", 32)
+
+	// Plain wizz to every radar of the recipient, no ref field.
+	alice.send(map[string]any{"type": "wizz", "to": "BOB"})
+	for _, b := range []*client{bob1, bob2} {
+		z := b.expect("wizz")
+		if _, has := z["ref"]; has || z["from"] != "alice" || z["avatarUrl"] != "https://avatars.example/alice" || z["at"] == "" {
+			t.Fatalf("wizz = %v", z)
+		}
+	}
+	carol.expectNo("wizz", 100*time.Millisecond)
+	// A second plain one within 5 minutes: ignored.
+	alice.send(map[string]any{"type": "wizz", "to": "bob", "ref": nil})
+	bob1.expectNo("wizz", 150*time.Millisecond)
+
+	// A nudge on a PR has its own limit, per ref.
+	alice.send(map[string]any{"type": "wizz", "to": "bob", "ref": ref1})
+	if z := bob1.expect("wizz"); z["ref"] != ref1 {
+		t.Fatalf("wizz = %v", z)
+	}
+	alice.send(map[string]any{"type": "wizz", "to": "bob", "ref": ref1})
+	bob1.expectNo("wizz", 150*time.Millisecond)
+	alice.send(map[string]any{"type": "wizz", "to": "bob", "ref": ref2})
+	if z := bob1.expect("wizz"); z["ref"] != ref2 {
+		t.Fatalf("wizz = %v", z)
+	}
+
+	// Quiet periods end: the plain one after 5 minutes, the ref one after 10.
+	age := func(d time.Duration) {
+		th.mu.Lock()
+		for k, until := range th.wizzUntil {
+			th.wizzUntil[k] = until.Add(-d)
+		}
+		th.mu.Unlock()
+	}
+	age(4*time.Minute + 50*time.Second)
+	alice.send(map[string]any{"type": "wizz", "to": "bob"})
+	bob1.expectNo("wizz", 150*time.Millisecond)
+	age(11 * time.Second)
+	alice.send(map[string]any{"type": "wizz", "to": "bob", "ref": ref1})
+	bob1.expectNo("wizz", 150*time.Millisecond)
+	alice.send(map[string]any{"type": "wizz", "to": "bob"})
+	bob1.expect("wizz")
+	age(5 * time.Minute)
+	alice.send(map[string]any{"type": "wizz", "to": "bob", "ref": ref1})
+	bob1.expect("wizz")
+
+	// Bob refuses plain wizzes: presence says so, plain ones are dropped, nudges pass.
+	bob1.send(map[string]any{"type": "status", "acceptsWizz": false})
+	carol.presenceWhere(func(p presenceMessage) bool { a, ok := acceptsWizzOf(p, "bob"); return ok && !a })
+	carol.send(map[string]any{"type": "wizz", "to": "bob"})
+	bob1.expectNo("wizz", 150*time.Millisecond)
+	carol.send(map[string]any{"type": "wizz", "to": "bob", "ref": ref1})
+	if z := bob1.expect("wizz"); z["from"] != "carol" || z["ref"] != ref1 {
+		t.Fatalf("wizz = %v", z)
+	}
+	// The dropped plain wizz did not use carol's quiet period.
+	bob2.send(map[string]any{"type": "status", "acceptsWizz": true})
+	carol.presenceWhere(func(p presenceMessage) bool { a, _ := acceptsWizzOf(p, "bob"); return a })
+	carol.send(map[string]any{"type": "wizz", "to": "bob"})
+	bob1.expect("wizz")
+	// Non-boolean values keep the current one.
+	bob1.send(map[string]any{"type": "status", "acceptsWizz": "no", "tabs": 9})
+	p := carol.presenceWhere(func(p presenceMessage) bool {
+		for _, o := range p.Online {
+			if o.Login == "bob" && o.Tabs == 10 {
+				return true
+			}
+		}
+		return false
+	})
+	if a, _ := acceptsWizzOf(p, "bob"); !a {
+		t.Fatal("acceptsWizz changed by a non-boolean")
+	}
+
+	// To oneself: ignored. Offline: undelivered.
+	alice.send(map[string]any{"type": "wizz", "to": "alice"})
+	alice.expectNo("wizz", 100*time.Millisecond)
+	alice.send(map[string]any{"type": "wizz", "to": "dave", "ref": ref1})
+	if u := alice.expect("undelivered"); u["kind"] != "wizz" || u["to"] != "dave" {
+		t.Fatalf("undelivered = %v", u)
+	}
+
+	logMu.Lock()
+	leaked := strings.Contains(logs.String(), ref1) || strings.Contains(logs.String(), ref2)
+	logMu.Unlock()
+	if leaked {
+		t.Fatal("ref in the logs")
+	}
+}
+
+func TestAcceptsWizzBelongsToLogin(t *testing.T) {
+	th := newTestHub(t)
+	watcher := th.online(t, "carol", "instance-c1")
+	token := th.issue(t, "bob")
+	b1 := th.dial(t)
+	h := hello("instance-b1", token)
+	h["acceptsWizz"] = false
+	b1.send(h)
+	b1.expect("welcome")
+	watcher.presenceWhere(func(p presenceMessage) bool { a, ok := acceptsWizzOf(p, "bob"); return ok && !a })
+	for _, m := range th.report().Members {
+		if m.Login == "bob" && (m.AcceptsWizz == nil || *m.AcceptsWizz) {
+			t.Fatalf("report acceptsWizz = %v", m.AcceptsWizz)
+		}
+	}
+	// A second radar without the field keeps it; the default comes back once offline.
+	b2 := th.dial(t)
+	b2.send(hello("instance-b2", token))
+	b2.expect("welcome")
+	watcher.presenceWhere(func(p presenceMessage) bool {
+		a, _ := acceptsWizzOf(p, "bob")
+		for _, o := range p.Online {
+			if o.Login == "bob" {
+				return len(o.Radars) == 2 && !a
+			}
+		}
+		return false
+	})
+	b1.c.Close(websocket.StatusNormalClosure, "")
+	b2.c.Close(websocket.StatusNormalClosure, "")
+	watcher.presenceWhere(func(p presenceMessage) bool { return len(p.Online) == 1 })
+	again := th.dial(t)
+	again.send(hello("instance-b1", token))
+	again.expect("welcome")
+	watcher.presenceWhere(func(p presenceMessage) bool { a, ok := acceptsWizzOf(p, "bob"); return ok && a })
+}
+
+func TestWizzBadRef(t *testing.T) {
+	for i, ref := range []any{"ABCD", strings.Repeat("A", 64), strings.Repeat("a", 63), strings.Repeat("g", 64), 42} {
+		th := newTestHub(t)
+		alice := th.online(t, "alice", "instance-a1")
+		th.online(t, "bob", "instance-b1")
+		alice.send(map[string]any{"type": "wizz", "to": "bob", "ref": ref})
+		t.Run(fmt.Sprint(i), func(t *testing.T) { alice.t = t; alice.closedWith("bad_message", 4002) })
+	}
+	th := newTestHub(t)
+	alice := th.online(t, "alice", "instance-a1")
+	alice.send(map[string]any{"type": "wizz", "to": "not a login"})
+	alice.closedWith("bad_message", 4002)
+}

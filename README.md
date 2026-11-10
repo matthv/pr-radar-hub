@@ -43,13 +43,15 @@ radar-hub watch [-tabs N]    act as a radar and print what it receives
 in its data directory, so they must run as the hub's user with the same `HUB_DATA_DIR`.
 
 `watch` is the test radar: it signs in (showing the GitHub code the first time), reports a
-tab count and prints every presence update, kudos and theme offer it receives (a theme
+tab count and prints every presence update, kudos, wizz and theme offer it receives (a theme
 offer is summed up, never printed). Lines typed on its input:
 
 - a number: the new tab count;
 - `available`, `focus` or `none`: the new availability;
 - `kudos <login>`: send a kudos;
 - `theme <login>`: offer a small test theme.
+- `wizz <login>`: send a plain wizz; `wizz <login> <ref>`: a nudge on a PR (64 hex characters);
+- `nowizz` or `yeswizz`: refuse or accept plain wizzes.
 
 It never takes a token on the command line: it reads `RADAR_HUB_TOKEN` from the
 environment, or the token it saved itself in `~/.config/radar-hub/watch-token`.

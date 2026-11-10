@@ -41,12 +41,15 @@ var (
 	commitPattern     = regexp.MustCompile(`^[0-9a-f]{4,64}$`)
 	loginPattern      = regexp.MustCompile(`^[A-Za-z0-9-]{1,39}$`)
 	themeNamePattern  = regexp.MustCompile(`^[a-z0-9-]{1,40}$`)
+	refPattern        = regexp.MustCompile(`^[0-9a-f]{64}$`)
 )
 
 const (
-	kudosPerPair    = time.Minute // one kudos per sender -> recipient pair in this window
-	offersPerMinute = 5           // theme offers per sender per minute
-	outQueue        = 16          // relayed messages waiting for one radar
+	kudosPerPair    = time.Minute      // one kudos per sender -> recipient pair in this window
+	offersPerMinute = 5                // theme offers per sender per minute
+	wizzPerRef      = 10 * time.Minute // one wizz per sender -> recipient -> ref
+	wizzPerPair     = 5 * time.Minute  // one plain wizz (no ref) per sender -> recipient
+	outQueue        = 16               // relayed messages waiting for one radar
 )
 
 type Hub struct {
@@ -63,9 +66,13 @@ type Hub struct {
 	dirty   bool
 	// avail is each online login's last availability, whichever of its radars sent it.
 	avail map[string]*string
+	// noWizz holds the online logins that refuse plain wizzes (acceptsWizz false).
+	noWizz map[string]bool
 	// kudosSent and offersSent hold the recent sends for the relay limits.
 	kudosSent  map[string]time.Time
 	offersSent map[string][]time.Time
+	// wizzUntil maps a sender/recipient(/ref) key to the end of its quiet period.
+	wizzUntil map[string]time.Time
 
 	// sessions counts the WebSocket handlers still running.
 	sessions sync.WaitGroup
@@ -85,6 +92,8 @@ type radar struct {
 	// availability received before the radar was registered (hello, or status during sign-in).
 	availSet bool
 	avail    *string
+	wizzSet  bool
+	accepts  bool
 }
 
 func newHub(cfg Config, store *Store, gh *GitHub, logger *log.Logger) *Hub {
@@ -100,6 +109,8 @@ func newHub(cfg Config, store *Store, gh *GitHub, logger *log.Logger) *Hub {
 		avail:      map[string]*string{},
 		kudosSent:  map[string]time.Time{},
 		offersSent: map[string][]time.Time{},
+		noWizz:     map[string]bool{},
+		wizzUntil:  map[string]time.Time{},
 	}
 }
 
@@ -116,6 +127,18 @@ type inMessage struct {
 	Availability json.RawMessage `json:"availability"`
 	To           string          `json:"to"`
 	Theme        json.RawMessage `json:"theme"`
+	Ref          *string         `json:"ref"`
+	// AcceptsWizz stays raw: absent, null or not a boolean keeps the current value.
+	AcceptsWizz json.RawMessage `json:"acceptsWizz"`
+}
+
+// acceptsWizz reads the optional field: set is false unless it is true or false.
+func (m *inMessage) acceptsWizz() (set bool, value bool) {
+	var v *bool
+	if len(m.AcceptsWizz) == 0 || json.Unmarshal(m.AcceptsWizz, &v) != nil || v == nil {
+		return false, false
+	}
+	return true, *v
 }
 
 // availability reads the optional field: set is false when it is absent. Anything but
@@ -159,6 +182,10 @@ func (m *inMessage) validate() bool {
 	switch m.Type {
 	case "kudos":
 		if !loginPattern.MatchString(m.To) {
+			return false
+		}
+	case "wizz":
+		if !loginPattern.MatchString(m.To) || (m.Ref != nil && !refPattern.MatchString(*m.Ref)) {
 			return false
 		}
 	case "theme_offer":
@@ -214,6 +241,7 @@ type presenceOnline struct {
 	Since        string          `json:"since"`
 	Tabs         int             `json:"tabs"`
 	Availability *string         `json:"availability"`
+	AcceptsWizz  bool            `json:"acceptsWizz"`
 	Radars       []presenceRadar `json:"radars"`
 }
 
@@ -234,6 +262,14 @@ type kudosMessage struct {
 	From      string `json:"from"`
 	AvatarURL string `json:"avatarUrl"`
 	At        string `json:"at"`
+}
+
+type wizzMessage struct {
+	Type      string  `json:"type"`
+	From      string  `json:"from"`
+	AvatarURL string  `json:"avatarUrl"`
+	At        string  `json:"at"`
+	Ref       *string `json:"ref,omitempty"`
 }
 
 type themeOfferMessage struct {
@@ -322,6 +358,9 @@ func (h *Hub) register(r *radar) {
 	if r.availSet {
 		h.avail[k] = r.avail
 	}
+	if r.wizzSet {
+		h.setAcceptsWizz(k, r.accepts)
+	}
 	for len(list) > h.cfg.MaxRadarsPerLogin {
 		list[0].kick("replaced", "too many radars for this login")
 		list = list[1:]
@@ -344,6 +383,7 @@ func (h *Hub) unregister(r *radar) bool {
 	if len(list) == 0 {
 		delete(h.radars, k)
 		delete(h.avail, k)
+		delete(h.noWizz, k)
 	} else {
 		h.radars[k] = list
 	}
@@ -366,6 +406,7 @@ func (h *Hub) kickLogin(login, code, message string) int {
 	}
 	delete(h.radars, key(login))
 	delete(h.avail, key(login))
+	delete(h.noWizz, key(login))
 	h.dirty = true
 	return len(list)
 }
@@ -432,7 +473,7 @@ func (h *Hub) presence() presenceMessage {
 		if len(list) == 0 {
 			continue
 		}
-		entry := presenceOnline{Login: list[0].login, AvatarURL: list[0].avatarURL, Since: stamp(list[0].since), Availability: h.avail[key(list[0].login)], Radars: []presenceRadar{}}
+		entry := presenceOnline{Login: list[0].login, AvatarURL: list[0].avatarURL, Since: stamp(list[0].since), Availability: h.avail[key(list[0].login)], AcceptsWizz: !h.noWizz[key(list[0].login)], Radars: []presenceRadar{}}
 		for _, r := range list {
 			entry.Tabs += r.tabs
 			entry.Radars = append(entry.Radars, presenceRadar{Commit: r.version.Commit, Behind: r.version.Behind, Tabs: r.tabs, Since: stamp(r.since)})
@@ -614,6 +655,57 @@ func (h *Hub) handleThemeOffer(r *radar, m inMessage) {
 	data, _ := json.Marshal(themeOfferMessage{Type: "theme_offer", ID: randomID(), From: r.login, AvatarURL: r.avatarURL, Theme: m.Theme})
 	if !h.relay(m.To, data) {
 		r.undelivered("theme_offer", m.To)
+	}
+}
+
+// setAcceptsWizz must be called with h.mu held.
+func (h *Hub) setAcceptsWizz(k string, accepts bool) {
+	if accepts {
+		delete(h.noWizz, k)
+	} else {
+		h.noWizz[k] = true
+	}
+}
+
+// allowWizz checks the recipient's choice for plain wizzes, then the quiet periods:
+// 10 minutes per sender -> recipient -> ref, 5 minutes per sender -> recipient without ref.
+func (h *Hub) allowWizz(from, to string, ref *string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if ref == nil && h.noWizz[key(to)] {
+		return false
+	}
+	now := h.now()
+	for k, until := range h.wizzUntil {
+		if !now.Before(until) {
+			delete(h.wizzUntil, k)
+		}
+	}
+	k, quiet := key(from)+" "+key(to), wizzPerPair
+	if ref != nil {
+		k, quiet = k+" "+*ref, wizzPerRef
+	}
+	if _, recent := h.wizzUntil[k]; recent {
+		return false
+	}
+	h.wizzUntil[k] = now.Add(quiet)
+	return true
+}
+
+func (h *Hub) handleWizz(r *radar, m inMessage) {
+	if key(m.To) == key(r.login) {
+		return
+	}
+	if !h.isOnline(m.To) {
+		r.undelivered("wizz", m.To)
+		return
+	}
+	if !h.allowWizz(r.login, m.To, m.Ref) {
+		return
+	}
+	data, _ := json.Marshal(wizzMessage{Type: "wizz", From: r.login, AvatarURL: r.avatarURL, At: stamp(h.now()), Ref: m.Ref})
+	if !h.relay(m.To, data) {
+		r.undelivered("wizz", m.To)
 	}
 }
 
@@ -830,17 +922,22 @@ func (s *session) run() {
 			if set, v := m.availability(); set {
 				s.h.avail[key(r.login)] = v
 			}
+			if set, v := m.acceptsWizz(); set {
+				s.h.setAcceptsWizz(key(r.login), v)
+			}
 			s.h.dirty = true
 			s.h.mu.Unlock()
 		case "kudos":
 			s.h.handleKudos(r, m)
 		case "theme_offer":
 			s.h.handleThemeOffer(r, m)
+		case "wizz":
+			s.h.handleWizz(r, m)
 		}
 	}
 }
 
-// applyStatus records tabs and version; availability is kept on the radar until it
+// applyStatus records tabs and version; availability and acceptsWizz are kept on the radar until it
 // is registered, then belongs to the login (see run).
 func (r *radar) applyStatus(m inMessage) {
 	if m.Tabs != nil {
@@ -851,6 +948,9 @@ func (r *radar) applyStatus(m inMessage) {
 	}
 	if set, v := m.availability(); set {
 		r.availSet, r.avail = true, v
+	}
+	if set, v := m.acceptsWizz(); set {
+		r.wizzSet, r.accepts = true, v
 	}
 }
 

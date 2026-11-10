@@ -5,8 +5,9 @@ enough on its own: everything the client needs to know about the hub is here.
 
 **What the hub does:** it tells every connected radar which teammates have their radar
 running, with how many tabs, on which version and whether they are available for a
-review or focused. It also relays two small person-to-person messages between online
-teammates: a kudos 🎉 and the offer of a PR Radar theme. Nothing else.
+review or focused. It also relays small person-to-person messages between online
+teammates: a kudos 🎉, a wizz (a nudge on a pull request, or just for fun) and the offer
+of a PR Radar theme. Nothing else.
 
 **What the hub never receives:** no pull request, no repository name, no PR title, no
 GitHub token of the user. The only identity proof is a one-time GitHub sign-in that
@@ -60,7 +61,7 @@ radar                                   hub
   | ---- status (on change) -----------> |
   | <--- presence (on any change) ------ |
   |                                      |
-  | ---- kudos / theme_offer ----------> |   relayed to the recipient's radars,
+  | ---- kudos / wizz / theme_offer ---> |   relayed to the recipient's radars,
   | <--- undelivered ------------------- |   or undelivered if they are offline
   |                                      |
   | <--- error + close ----------------- |   on refusal, see the error table
@@ -81,7 +82,8 @@ The first message, and the only one accepted before `welcome`. Must arrive withi
   "instanceId": "5f0c3b1e-8d0a-4f5e-9a51-3c6c1f2e7b90",
   "version": { "commit": "129a21f3c4d5e6f708192a3b4c5d6e7f80912a3b", "behind": 2 },
   "tabs": 1,
-  "availability": "available"
+  "availability": "available",
+  "acceptsWizz": true
 }
 ```
 
@@ -94,6 +96,7 @@ The first message, and the only one accepted before `welcome`. Must arrive withi
 | `version.behind` | integer or `null` | Commits behind `origin/main`, as computed by `update.js`; `null` when not checked yet or the check failed |
 | `tabs` | integer ≥ 0 | Board tabs currently open. `0` still means *online*: the radar runs |
 | `availability` | `"available"`, `"focus"` or `null`, optional | The user's state, see below |
+| `acceptsWizz` | boolean, optional | Whether the user accepts plain wizzes, see below |
 
 A radar in **demo mode** (`PR_RADAR_DEMO`) never connects to the hub.
 
@@ -114,9 +117,21 @@ An **absent** field keeps the current value, while `null` clears it. A radar tha
 does not know the user's choice should therefore omit the field in `hello`, rather
 than send `null` and erase what another of the user's radars set.
 
+#### `acceptsWizz`
+
+`false` refuses **plain** wizzes (without `ref`, see [`wizz`](#wizz)): the hub drops
+them silently. Nudges on a pull request (with `ref`) always get through: they are work
+requests, and the recipient still controls the animation with the `"focus"` state.
+
+Like `availability`, the value belongs to the login: the last value received from any
+of the user's radars wins. An absent field keeps the current value; `null` or anything
+that is not a boolean is ignored too. The default is `true`, which comes back when the
+user's last radar disconnects or the hub restarts: a radar that stores the user's
+choice sends it again in `hello`.
+
 ### `status`
 
-Sent whenever `version`, `tabs` or `availability` changes. Same fields as in `hello`, all optional:
+Sent whenever `version`, `tabs`, `availability` or `acceptsWizz` changes. Same fields as in `hello`, all optional:
 send what changed or everything, the hub keeps the last value of each field.
 
 ```json
@@ -149,6 +164,44 @@ A 🎉 for an online teammate.
 - At most **one kudos per minute** for a given sender → recipient pair, whichever
   radars send it. The extra ones are **ignored** silently, without closing: the
   radar should disable the button for a minute rather than rely on this.
+
+### `wizz`
+
+A nudge for an online teammate. With `ref`, it is about one pull request ("your review on
+this one, please"): the recipient's radar highlights that PR's card. Without `ref`, it
+is a plain wizz: the recipient's whole page shakes.
+
+```json
+{ "type": "wizz", "to": "bexchauveto", "ref": "3f1c9a…64 hex characters" }
+```
+
+```json
+{ "type": "wizz", "to": "bexchauveto" }
+```
+
+| Field | Notes |
+| --- | --- |
+| `to` | GitHub login of the recipient, as for `kudos` |
+| `ref` | Optional. Exactly 64 lowercase hexadecimal characters, `^[0-9a-f]{64}$`; absent or `null` for a plain wizz. Anything else is `bad_message` |
+
+`ref` is opaque to the hub: it relays it without interpreting it, and never stores or
+logs it. PR Radar computes it as the SHA-256 of the pull request's canonical URL
+(`https://github.com/<owner>/<repo>/pull/<n>`), and the recipient's radar looks it up in
+its own list. This is pseudonymisation, not secrecy: someone who already knows the URL
+can recognise the hash.
+
+- The hub sends a [`wizz`](#wizz-1) to **every** connected radar of `to`.
+- If `to` has no radar connected, the sender gets [`undelivered`](#undelivered) with
+  `"kind": "wizz"`.
+- A wizz to oneself is ignored.
+- A plain wizz to someone with `acceptsWizz: false` is ignored. A wizz with `ref`
+  always gets through.
+- The hub does not look at `availability`: the recipient's radar decides whether to
+  animate in `"focus"`.
+- At most **one wizz with `ref` per 10 minutes** for a given sender → recipient → `ref`,
+  and **one plain wizz per 5 minutes** for a given sender → recipient. The extra ones are
+  ignored silently, without closing; a wizz dropped because of `acceptsWizz` does not
+  start the 5 minutes.
 
 ### `theme_offer`
 
@@ -229,8 +282,8 @@ again.
 ### `presence`
 
 The full list of online teammates. Sent right after `welcome`, then on every change
-(someone connects, leaves, changes tabs, version or availability), at most once per
-second.
+(someone connects, leaves, changes tabs, version, availability or `acceptsWizz`), at
+most once per second.
 It always carries the whole list, never a diff: the radar replaces what it had.
 
 ```json
@@ -243,6 +296,7 @@ It always carries the whole list, never a diff: the radar replaces what it had.
       "since": "2026-11-06T08:41:12Z",
       "tabs": 3,
       "availability": "focus",
+      "acceptsWizz": true,
       "radars": [
         { "commit": "129a21f3c4d5…", "behind": 0, "tabs": 2, "since": "2026-11-06T08:41:12Z" },
         { "commit": "d7da2a3b9e8f…", "behind": 1, "tabs": 1, "since": "2026-11-06T09:02:40Z" }
@@ -261,6 +315,7 @@ It always carries the whole list, never a diff: the radar replaces what it had.
 | `online[].since` | When their earliest connected radar connected |
 | `online[].tabs` | Sum over their radars |
 | `online[].availability` | `"available"`, `"focus"` or `null`: the last value received from any of their radars |
+| `online[].acceptsWizz` | `false` when they refuse plain wizzes; the radar should then disable the plain wizz button |
 | `online[].radars[]` | One per running radar (machine), oldest first. `behind` is the hub's best indication of who should update |
 | `recent[]` | Members not online now but seen in the last 14 days, most recent first |
 
@@ -279,6 +334,22 @@ Timestamps are UTC, ISO 8601, second precision.
 
 A teammate sent a kudos. Each of the recipient's radars gets one; showing the
 animation in every open tab is up to the radar.
+
+### `wizz`
+
+```json
+{
+  "type": "wizz",
+  "from": "matthv",
+  "avatarUrl": "https://avatars.githubusercontent.com/u/123456?v=4",
+  "at": "2026-11-10T10:00:00Z",
+  "ref": "3f1c9a…64 hex characters"
+}
+```
+
+`ref` is present only when the sender sent one. Each of the recipient's radars gets the
+wizz. A radar that does not find `ref` in its list should still show a generic notice
+("matthv is nudging you on a pull request") rather than guess.
 
 ### `theme_offer`
 
@@ -302,8 +373,8 @@ There is no answer to send back: accepting or refusing stays local.
 { "type": "undelivered", "kind": "kudos", "to": "bexchauveto" }
 ```
 
-Sent to the sender's radar only, when the recipient of a `kudos` or a `theme_offer`
-(`kind`) has no radar connected anymore. A message dropped by a limit gets no
+Sent to the sender's radar only, when the recipient of a `kudos`, a `wizz` or a
+`theme_offer` (`kind`) has no radar connected anymore. A message dropped by a limit gets no
 `undelivered`.
 
 ### `error`
@@ -392,6 +463,8 @@ The hub token only gives access to the presence list, but it is still a credenti
 | Messages per connection | 30 per minute, all types |
 | Kudos | 1 per minute per sender → recipient pair (extra ignored) |
 | Theme offers | 5 per minute per sender (extra ignored) |
+| Wizz with `ref` | 1 per 10 minutes per sender → recipient → `ref` (extra ignored) |
+| Plain wizz | 1 per 5 minutes per sender → recipient (extra ignored) |
 | Connections per IP | 64 (one office NAT can carry the whole team) |
 | Sign-ins waiting for approval per IP | 5 |
 | Radars per login | 10; the 11th closes the oldest with `replaced` |
@@ -400,10 +473,10 @@ The hub token only gives access to the presence list, but it is still a credenti
 
 - Per login: avatar URL, SHA-256 hashes of the hub tokens with their issue date and
   revocation, first and last time seen, last version seen.
-- Live presence and availability stay in memory and are lost when the hub restarts;
+- Live presence, availability and `acceptsWizz` stay in memory and are lost when the hub restarts;
   radars reconnect within seconds and resend their state in `hello`.
-- Kudos and theme offers are relayed and forgotten: neither is written to disk or to
-  the logs. Only the recent send times are kept in memory, for the limits.
+- Kudos, wizzes (with their `ref`) and theme offers are relayed and forgotten: none is
+  written to disk or to the logs. Only the recent send times are kept in memory, for the limits.
 - No GitHub token, no IP address, no pull request data.
 
 ## Extending the protocol

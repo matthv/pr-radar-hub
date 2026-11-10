@@ -27,6 +27,8 @@ import (
 //	available|focus|none   new availability
 //	kudos <login>     send a kudos
 //	theme <login>     offer a small test theme
+//	wizz <login> [ref]     send a wizz (with a 64-hex ref: a nudge on a PR)
+//	nowizz|yeswizz    refuse or accept plain wizzes
 //
 // A received theme offer is summed up (name, label, sizes), never printed in full.
 
@@ -117,6 +119,12 @@ func cmdWatch(args []string) error {
 				msg = map[string]any{"type": "status", "availability": f[0]}
 			case len(f) == 1 && f[0] == "none":
 				msg = map[string]any{"type": "status", "availability": nil}
+			case len(f) == 1 && (f[0] == "nowizz" || f[0] == "yeswizz"):
+				msg = map[string]any{"type": "status", "acceptsWizz": f[0] == "yeswizz"}
+			case len(f) == 2 && f[0] == "wizz":
+				msg = map[string]any{"type": "wizz", "to": f[1]}
+			case len(f) == 3 && f[0] == "wizz":
+				msg = map[string]any{"type": "wizz", "to": f[1], "ref": f[2]}
 			case len(f) == 2 && f[0] == "kudos":
 				msg = map[string]any{"type": "kudos", "to": f[1]}
 			case len(f) == 2 && f[0] == "theme":
@@ -129,7 +137,7 @@ func cmdWatch(args []string) error {
 				}
 			}
 			if msg == nil {
-				fmt.Println("(type a tab count, available|focus|none, kudos <login> or theme <login>)")
+				fmt.Println("(type a tab count, available|focus|none, kudos|wizz|theme <login>, wizz <login> <ref>, nowizz|yeswizz)")
 				continue
 			}
 			_ = writeJSON(ctx, c, msg)
@@ -179,6 +187,14 @@ func cmdWatch(args []string) error {
 			var k kudosMessage
 			_ = json.Unmarshal(data, &k)
 			fmt.Printf("🎉 kudos from %s\n", k.From)
+		case "wizz":
+			var z wizzMessage
+			_ = json.Unmarshal(data, &z)
+			if z.Ref != nil {
+				fmt.Printf("📳 wizz from %s on PR ref %s\n", z.From, *z.Ref)
+			} else {
+				fmt.Printf("📳 wizz from %s\n", z.From)
+			}
 		case "theme_offer":
 			var o themeOfferMessage
 			var t themeShape
@@ -219,6 +235,9 @@ func printPresence(p presenceMessage) {
 		av := ""
 		if o.Availability != nil {
 			av = " (" + *o.Availability + ")"
+		}
+		if !o.AcceptsWizz {
+			av += " [no wizz]"
 		}
 		fmt.Printf("  ● %-20s %d tab(s)%s", o.Login, o.Tabs, av)
 		for _, r := range o.Radars {

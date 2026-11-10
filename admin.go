@@ -30,6 +30,7 @@ type statusMember struct {
 	Login        string        `json:"login"`
 	Online       bool          `json:"online"`
 	Availability *string       `json:"availability,omitempty"`
+	AcceptsWizz  *bool         `json:"acceptsWizz,omitempty"`
 	Radars       []statusRadar `json:"radars,omitempty"`
 	LastSeen     time.Time     `json:"lastSeen"`
 	LastVersion  *Version      `json:"lastVersion,omitempty"`
@@ -53,6 +54,10 @@ func (h *Hub) report() statusReport {
 	for k, v := range h.avail {
 		avail[k] = v
 	}
+	noWizz := map[string]bool{}
+	for k := range h.noWizz {
+		noWizz[k] = true
+	}
 	for k, list := range h.radars {
 		for _, r := range list {
 			online[k] = append(online[k], statusRadar{Commit: r.version.Commit, Behind: r.version.Behind, Tabs: r.tabs, Since: r.since.UTC()})
@@ -73,7 +78,8 @@ func (h *Hub) report() statusReport {
 		sort.Strings(sm.Sources)
 		sm.Revoked = len(m.Tokens) > 0 && sm.ActiveTokens == 0
 		if rs, ok := online[key(m.Login)]; ok {
-			sm.Online, sm.Radars, sm.Availability = true, rs, avail[key(m.Login)]
+			accepts := !noWizz[key(m.Login)]
+			sm.Online, sm.Radars, sm.Availability, sm.AcceptsWizz = true, rs, avail[key(m.Login)], &accepts
 		}
 		rep.Members = append(rep.Members, sm)
 	}
@@ -249,7 +255,7 @@ func cmdStatus(cfg Config, asJSON bool) error {
 	fmt.Println()
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "LOGIN\tSTATE\tAVAILABILITY\tVERSION\tTABS\tSEEN\tACCESS")
+	fmt.Fprintln(w, "LOGIN\tSTATE\tAVAILABILITY\tWIZZ\tVERSION\tTABS\tSEEN\tACCESS")
 	for _, m := range rep.Members {
 		access := strings.Join(m.Sources, ",")
 		switch {
@@ -260,14 +266,17 @@ func cmdStatus(cfg Config, asJSON bool) error {
 		}
 		if m.Online {
 			for i, r := range m.Radars {
-				state, login, av := "online", m.Login, "-"
+				state, login, av, wz := "online", m.Login, "-", "yes"
 				if m.Availability != nil {
 					av = *m.Availability
 				}
-				if i > 0 {
-					state, login, av = "", "", ""
+				if m.AcceptsWizz != nil && !*m.AcceptsWizz {
+					wz = "no"
 				}
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\tsince %s\t%s\n", login, state, av, versionText(r.Commit, r.Behind), r.Tabs, r.Since.Local().Format("15:04"), access)
+				if i > 0 {
+					state, login, av, wz = "", "", "", ""
+				}
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\tsince %s\t%s\n", login, state, av, wz, versionText(r.Commit, r.Behind), r.Tabs, r.Since.Local().Format("15:04"), access)
 			}
 			continue
 		}
@@ -275,7 +284,7 @@ func cmdStatus(cfg Config, asJSON bool) error {
 		if m.LastVersion != nil {
 			v = versionText(m.LastVersion.Commit, m.LastVersion.Behind)
 		}
-		fmt.Fprintf(w, "%s\toffline\t\t%s\t-\t%s\t%s\n", m.Login, v, ago(m.LastSeen), access)
+		fmt.Fprintf(w, "%s\toffline\t\t\t%s\t-\t%s\t%s\n", m.Login, v, ago(m.LastSeen), access)
 	}
 	return w.Flush()
 }
