@@ -42,6 +42,7 @@ var (
 	loginPattern      = regexp.MustCompile(`^[A-Za-z0-9-]{1,39}$`)
 	themeNamePattern  = regexp.MustCompile(`^[a-z0-9-]{1,40}$`)
 	refPattern        = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	roomPattern       = regexp.MustCompile(`^https://meet\.google\.com/[a-z]{3}-[a-z]{4}-[a-z]{3}$`)
 )
 
 const (
@@ -94,6 +95,9 @@ type radar struct {
 	out        chan []byte
 	kickOnce   sync.Once
 	// availability received before the radar was registered (hello, or status during sign-in).
+	// room is the Google Meet link this radar's user has open. It belongs to the radar,
+	// never leaves memory and is never logged: the link alone lets anyone in.
+	room     *string
 	availSet bool
 	avail    *string
 	wizzSet  bool
@@ -135,6 +139,21 @@ type inMessage struct {
 	Ref          *string         `json:"ref"`
 	// AcceptsWizz stays raw: absent, null or not a boolean keeps the current value.
 	AcceptsWizz json.RawMessage `json:"acceptsWizz"`
+	// Room stays raw to tell an absent field (keep the value) from null.
+	Room json.RawMessage `json:"room"`
+}
+
+// room reads the optional field: set is false when it is absent. Anything but a Meet
+// room link counts as null.
+func (m *inMessage) room() (set bool, value *string) {
+	if len(m.Room) == 0 {
+		return false, nil
+	}
+	var v string
+	if json.Unmarshal(m.Room, &v) == nil && roomPattern.MatchString(v) {
+		return true, &v
+	}
+	return true, nil
 }
 
 // acceptsWizz reads the optional field: set is false unless it is true or false.
@@ -248,6 +267,7 @@ type presenceOnline struct {
 	Tabs         int             `json:"tabs"`
 	Availability *string         `json:"availability"`
 	AcceptsWizz  bool            `json:"acceptsWizz"`
+	Room         *string         `json:"room"`
 	Radars       []presenceRadar `json:"radars"`
 }
 
@@ -482,6 +502,10 @@ func (h *Hub) presence() presenceMessage {
 		entry := presenceOnline{Login: list[0].login, AvatarURL: list[0].avatarURL, Since: stamp(list[0].since), Availability: h.avail[key(list[0].login)], AcceptsWizz: !h.noWizz[key(list[0].login)], Radars: []presenceRadar{}}
 		for _, r := range list {
 			entry.Tabs += r.tabs
+			// The list is in connection order: the oldest radar in a room wins.
+			if entry.Room == nil && r.room != nil {
+				entry.Room = r.room
+			}
 			entry.Radars = append(entry.Radars, presenceRadar{Commit: r.version.Commit, Behind: r.version.Behind, Tag: r.version.Tag, Tabs: r.tabs, Since: stamp(r.since)})
 		}
 		online[key(entry.Login)] = true
@@ -993,6 +1017,9 @@ func (r *radar) applyStatus(m inMessage) {
 	}
 	if set, v := m.availability(); set {
 		r.availSet, r.avail = true, v
+	}
+	if set, v := m.room(); set {
+		r.room = v
 	}
 	if set, v := m.acceptsWizz(); set {
 		r.wizzSet, r.accepts = true, v

@@ -623,11 +623,26 @@ func TestThemeOfferSize(t *testing.T) {
 		t.Fatal("theme content on disk or in the logs")
 	}
 
-	// Over 110 KiB, even a theme offer closes with 1009.
+	// Over 110 KiB, even a theme offer is refused. The hub stops reading mid-message, so
+	// the unread rest may reset the connection before its 1009 arrives: accept either.
 	big["css"] = strings.Repeat("x", 111<<10)
 	data, _ = json.Marshal(map[string]any{"type": "theme_offer", "to": "bob", "theme": big})
 	alice.sendRaw(data)
-	alice.closedWith("", websocket.StatusMessageTooBig)
+	deadline := time.After(3 * time.Second)
+	for closed := false; !closed; {
+		select {
+		case _, ok := <-alice.msgs:
+			if !ok {
+				err := <-alice.err
+				if s := websocket.CloseStatus(err); s != websocket.StatusMessageTooBig && !strings.Contains(err.Error(), "reset by peer") {
+					t.Fatalf("closed with %v, want 1009 or a reset", err)
+				}
+				closed = true
+			}
+		case <-deadline:
+			t.Fatal("connection not closed")
+		}
+	}
 }
 
 func TestOtherTypesStayAt16KiB(t *testing.T) {
@@ -1277,4 +1292,159 @@ func TestVersionTag(t *testing.T) {
 	if len(r.Members) != 1 || len(r.Members[0].Radars) != 1 || r.Members[0].Radars[0].Tag == nil || *r.Members[0].Radars[0].Tag != "v2.0.0" {
 		t.Fatalf("report = %+v", r.Members)
 	}
+}
+
+// Meet room.
+
+func roomOf(p presenceMessage, login string) (room string, online bool) {
+	for _, o := range p.Online {
+		if o.Login == login {
+			if o.Room == nil {
+				return "", true
+			}
+			return *o.Room, true
+		}
+	}
+	return "", false
+}
+
+func roomIs(login, want string) func(presenceMessage) bool {
+	return func(p presenceMessage) bool { r, ok := roomOf(p, login); return ok && r == want }
+}
+
+func TestRoom(t *testing.T) {
+	var logs strings.Builder
+	var logMu sync.Mutex
+	th := newTestHub(t)
+	th.log = log.New(writerFunc(func(p []byte) (int, error) { logMu.Lock(); defer logMu.Unlock(); return logs.Write(p) }), "", 0)
+	const room1 = "https://meet.google.com/abc-defg-hij"
+	const room2 = "https://meet.google.com/xyz-wxyz-klm"
+
+	watcher := th.online(t, "carol", "instance-c1")
+	token := th.issue(t, "alice")
+	cl := th.dial(t)
+	h := hello("instance-a1", token)
+	h["room"] = room1
+	cl.send(h)
+	cl.expect("welcome")
+	watcher.presenceWhere(roomIs("alice", room1))
+
+	// Each change triggers a presence; null clears; absent keeps.
+	cl.send(map[string]any{"type": "status", "room": room2})
+	watcher.presenceWhere(roomIs("alice", room2))
+	cl.send(map[string]any{"type": "status", "tabs": 4})
+	p := watcher.presenceWhere(func(p presenceMessage) bool {
+		for _, o := range p.Online {
+			if o.Login == "alice" && o.Tabs == 4 {
+				return true
+			}
+		}
+		return false
+	})
+	if r, _ := roomOf(p, "alice"); r != room2 {
+		t.Fatalf("absent room changed it to %q", r)
+	}
+	cl.send(map[string]any{"type": "status", "room": nil})
+	watcher.presenceWhere(roomIs("alice", ""))
+
+	// Invalid values count as null, without closing.
+	for _, bad := range []any{
+		"javascript:alert(1)",
+		"https://evil.example/abc-defg-hij",
+		"https://meet.google.com/abc-defg-hij?authuser=1",
+		"https://meet.google.com/abc-defg-hij/",
+		"http://meet.google.com/abc-defg-hij",
+		"https://meet.google.com.evil.example/abc-defg-hij",
+		"https://meet.google.com/ABC-DEFG-HIJ",
+		"https://meet.google.com/abc-defg-hij\n",
+		42, true, map[string]any{}, []any{room1},
+	} {
+		cl.send(map[string]any{"type": "status", "room": room1})
+		watcher.presenceWhere(roomIs("alice", room1))
+		cl.send(map[string]any{"type": "status", "room": bad})
+		watcher.presenceWhere(roomIs("alice", ""))
+	}
+
+	// The JSON always carries the field, null included; status says only yes or no.
+	cl.send(map[string]any{"type": "status", "tabs": 6})
+	for {
+		m := watcher.expect("presence")
+		var entry map[string]any
+		for _, o := range m["online"].([]any) {
+			if o.(map[string]any)["login"] == "alice" {
+				entry = o.(map[string]any)
+			}
+		}
+		if entry == nil || entry["tabs"].(float64) != 6 {
+			continue
+		}
+		if v, has := entry["room"]; !has || v != nil {
+			t.Fatalf("online[].room = %v (present %v)", v, has)
+		}
+		break
+	}
+	cl.send(map[string]any{"type": "status", "room": room1})
+	watcher.presenceWhere(roomIs("alice", room1))
+	rep, _ := json.Marshal(th.report())
+	if strings.Contains(string(rep), "meet.google.com") {
+		t.Fatal("room link in the admin report")
+	}
+
+	logMu.Lock()
+	all := logs.String()
+	logMu.Unlock()
+	files, _ := os.ReadDir(th.cfg.DataDir)
+	for _, f := range files {
+		b, _ := os.ReadFile(filepath.Join(th.cfg.DataDir, f.Name()))
+		all += string(b)
+	}
+	if strings.Contains(all, "meet.google.com") || strings.Contains(all, "abc-defg-hij") {
+		t.Fatal("room link in the logs or on disk")
+	}
+}
+
+func TestRoomBelongsToRadar(t *testing.T) {
+	th := newTestHub(t)
+	const roomA = "https://meet.google.com/aaa-aaaa-aaa"
+	const roomB = "https://meet.google.com/bbb-bbbb-bbb"
+	watcher := th.online(t, "carol", "instance-c1")
+	token := th.issue(t, "alice")
+
+	first := th.dial(t)
+	first.send(hello("instance-a1", token))
+	first.expect("welcome")
+	second := th.dial(t)
+	h := hello("instance-a2", token)
+	h["room"] = roomB
+	second.send(h)
+	second.expect("welcome")
+	// Only the newer radar is in a room: it is shown.
+	watcher.presenceWhere(roomIs("alice", roomB))
+
+	// The older radar joins a room: the oldest one with a room wins.
+	first.send(map[string]any{"type": "status", "room": roomA})
+	watcher.presenceWhere(roomIs("alice", roomA))
+
+	// It leaves: the other radar's room takes over, then null.
+	first.c.Close(websocket.StatusNormalClosure, "")
+	watcher.presenceWhere(func(p presenceMessage) bool {
+		for _, o := range p.Online {
+			if o.Login == "alice" {
+				return len(o.Radars) == 1 && o.Room != nil && *o.Room == roomB
+			}
+		}
+		return false
+	})
+	second.send(map[string]any{"type": "status", "room": nil})
+	watcher.presenceWhere(roomIs("alice", ""))
+
+	// A radar that reconnects has no room until it says so.
+	second.send(map[string]any{"type": "status", "room": roomB})
+	watcher.presenceWhere(roomIs("alice", roomB))
+	second.c.Close(websocket.StatusNormalClosure, "")
+	watcher.presenceWhere(func(p presenceMessage) bool { _, ok := roomOf(p, "alice"); return !ok })
+	again := th.dial(t)
+	again.send(hello("instance-a2", token))
+	again.expect("welcome")
+	watcher.presenceWhere(roomIs("alice", ""))
 }

@@ -53,6 +53,7 @@ offer is summed up, never printed). Lines typed on its input:
 - `wizz <login>`: send a plain wizz; `wizz <login> <ref>`: a nudge on a PR (64 hex characters);
 - `nowizz` or `yeswizz`: refuse or accept plain wizzes.
 - `tag v1.2.0` or `tag none`: the release tag reported (`-tag` sets the first one).
+- `room https://meet.google.com/abc-defg-hij` or `room none`: the Meet room this radar is in.
 
 It never takes a token on the command line: it reads `RADAR_HUB_TOKEN` from the
 environment, or the token it saved itself in `~/.config/radar-hub/watch-token`.

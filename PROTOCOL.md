@@ -4,8 +4,8 @@ This is the reference for writing the hub client inside PR Radar. It is meant to
 enough on its own: everything the client needs to know about the hub is here.
 
 **What the hub does:** it tells every connected radar which teammates have their radar
-running, with how many tabs, on which version and whether they are available for a
-review or focused. It also relays small person-to-person messages between online
+running, with how many tabs, on which version, whether they are available for a
+review or focused, and the Google Meet room they are in. It also relays small person-to-person messages between online
 teammates: a kudos 🎉, a wizz (a nudge on a pull request, or just for fun) and the offer
 of a PR Radar theme. Nothing else.
 
@@ -99,6 +99,7 @@ The first message, and the only one accepted before `welcome`. Must arrive withi
 | `tabs` | integer ≥ 0 | Board tabs currently open. `0` still means *online*: the radar runs |
 | `availability` | `"available"`, `"focus"` or `null`, optional | The user's state, see below |
 | `acceptsWizz` | boolean, optional | Whether the user accepts plain wizzes, see below |
+| `room` | string or `null`, optional | The Google Meet room this radar's user has open, see below |
 
 A radar in **demo mode** (`PR_RADAR_DEMO`) never connects to the hub.
 
@@ -131,9 +132,26 @@ that is not a boolean is ignored too. The default is `true`, which comes back wh
 user's last radar disconnects or the hub restarts: a radar that stores the user's
 choice sends it again in `hello`.
 
+#### `room`
+
+The Google Meet room the user has open on this machine (PR Radar's `PR_RADAR_ROOM_URL`,
+when it sees the room's window). Teammates see "in room" on the user's line and join
+in one click.
+
+- Format: `^https://meet\.google\.com/[a-z]{3}-[a-z]{4}-[a-z]{3}$`, nothing more (no
+  query string, no trailing slash). Any other value counts as `null`, without
+  `bad_message`.
+- It belongs to the **radar** (`instanceId`), not to the login: the window is open on
+  one machine. It lives in memory only and is forgotten when that radar disconnects.
+- An absent field keeps the current value, `null` clears it. A radar sends `room` in
+  `hello` only when it is in the room, so a radar that just connected has none.
+- The link alone lets anyone in: the hub never writes it to disk or to the logs, and
+  `radar-hub status` only says whether a radar is in a room. The receiving radar
+  validates the link again before making it a link.
+
 ### `status`
 
-Sent whenever `version`, `tabs`, `availability` or `acceptsWizz` changes. Same fields as in `hello`, all optional:
+Sent whenever `version`, `tabs`, `availability`, `acceptsWizz` or `room` changes. Same fields as in `hello`, all optional:
 send what changed or everything, the hub keeps the last value of each field.
 `version` is one value: a `version` object replaces the previous one whole, so send
 `commit`, `behind` and `tag` together.
@@ -294,8 +312,8 @@ again.
 ### `presence`
 
 The full list of online teammates. Sent right after `welcome`, then on every change
-(someone connects, leaves, or changes tabs, version including `tag`, availability or
-`acceptsWizz`), at most once per second.
+(someone connects, leaves, or changes tabs, version including `tag`, availability,
+`acceptsWizz` or room), at most once per second.
 It always carries the whole list, never a diff: the radar replaces what it had.
 
 ```json
@@ -309,6 +327,7 @@ It always carries the whole list, never a diff: the radar replaces what it had.
       "tabs": 3,
       "availability": "focus",
       "acceptsWizz": true,
+      "room": "https://meet.google.com/abc-defg-hij",
       "radars": [
         { "commit": "129a21f3c4d5…", "behind": 0, "tag": "v1.2.0", "tabs": 2, "since": "2026-11-06T08:41:12Z" },
         { "commit": "d7da2a3b9e8f…", "behind": 1, "tag": null, "tabs": 1, "since": "2026-11-06T09:02:40Z" }
@@ -327,6 +346,7 @@ It always carries the whole list, never a diff: the radar replaces what it had.
 | `online[].since` | When their earliest connected radar connected |
 | `online[].tabs` | Sum over their radars |
 | `online[].availability` | `"available"`, `"focus"` or `null`: the last value received from any of their radars |
+| `online[].room` | Always present: the room of the user's oldest radar that has one, or `null`. When that radar leaves or clears it, the next one's room takes over |
 | `online[].acceptsWizz` | `false` when they refuse plain wizzes; the radar should then disable the plain wizz button |
 | `online[].radars[]` | One per running radar (machine), oldest first. `behind` is the hub's best indication of who should update |
 | `online[].radars[].tag` | Always present: the radar's release tag, or `null` (none, unknown, or an older radar). A change triggers a `presence` |
@@ -417,7 +437,7 @@ reason, so a client that missed the message still knows.
 | `not_member` | 4014 | The GitHub account is not an active member of the org | Delete the stored token, **stop** until the radar restarts |
 | `revoked` | 4015 | The token was revoked by the hub admin, or the user left the org | Delete the stored token, **stop** until the radar restarts |
 | — | 1001 | The hub is restarting | Reconnect with backoff |
-| — | 1009 | A message over 16 KiB, or a `theme_offer` over 110 KiB | Reconnect with backoff (and log) |
+| — | 1009 | A message over 16 KiB, or a `theme_offer` over 110 KiB. Over 110 KiB the hub stops reading mid-message, so the connection may drop before the 1009 arrives | Reconnect with backoff (and log) |
 | — | 1011 | Hub internal error | Reconnect with backoff |
 | — (HTTP 429 on upgrade) | — | Too many connections from this IP | Reconnect with backoff |
 | — (network error, 502, 503…) | — | Hub down or unreachable | Reconnect with backoff |
@@ -486,11 +506,11 @@ The hub token only gives access to the presence list, but it is still a credenti
 
 - Per login: avatar URL, SHA-256 hashes of the hub tokens with their issue date and
   revocation, first and last time seen, last version seen.
-- Live presence, availability and `acceptsWizz` stay in memory and are lost when the hub restarts;
+- Live presence, availability, `acceptsWizz` and Meet rooms stay in memory and are lost when the hub restarts;
   radars reconnect within seconds and resend their state in `hello`.
 - Kudos, wizzes (with their `ref`) and theme offers are relayed and forgotten: none is
   written to disk or to the logs. Only the recent send times are kept in memory, for the limits.
-- No GitHub token, no IP address, no pull request data.
+- No GitHub token, no IP address, no pull request data, no Meet link.
 
 ## Extending the protocol
 

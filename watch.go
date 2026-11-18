@@ -30,6 +30,7 @@ import (
 //	wizz <login> [ref]     send a wizz (with a 64-hex ref: a nudge on a PR)
 //	nowizz|yeswizz    refuse or accept plain wizzes
 //	tag v1.2.0|none   new release tag
+//	room <meet link>|none  the Google Meet room this radar is in
 //
 // A received theme offer is summed up (name, label, sizes), never printed in full.
 
@@ -129,6 +130,11 @@ func cmdWatch(args []string) error {
 				msg = map[string]any{"type": "status", "availability": nil}
 			case len(f) == 1 && (f[0] == "nowizz" || f[0] == "yeswizz"):
 				msg = map[string]any{"type": "status", "acceptsWizz": f[0] == "yeswizz"}
+			case len(f) == 2 && f[0] == "room":
+				msg = map[string]any{"type": "status", "room": f[1]}
+				if f[1] == "none" {
+					msg["room"] = nil
+				}
 			case len(f) == 2 && f[0] == "tag":
 				// A version replaces the previous one whole: resend commit and behind.
 				nv := map[string]any{"commit": v["commit"], "behind": v["behind"], "tag": f[1]}
@@ -152,7 +158,7 @@ func cmdWatch(args []string) error {
 				}
 			}
 			if msg == nil {
-				fmt.Println("(type a tab count, available|focus|none, kudos|wizz|theme <login>, wizz <login> <ref>, nowizz|yeswizz, tag v1.2.0|none)")
+				fmt.Println("(type a tab count, available|focus|none, kudos|wizz|theme <login>, wizz <login> <ref>, nowizz|yeswizz, tag v1.2.0|none, room <link>|none)")
 				continue
 			}
 			_ = writeJSON(ctx, c, msg)
@@ -253,6 +259,9 @@ func printPresence(p presenceMessage) {
 		}
 		if !o.AcceptsWizz {
 			av += " [no wizz]"
+		}
+		if o.Room != nil {
+			av += " in room " + *o.Room
 		}
 		fmt.Printf("  ● %-20s %d tab(s)%s", o.Login, o.Tabs, av)
 		for _, r := range o.Radars {
